@@ -427,6 +427,11 @@ test("upsertBotComment creates a comment when no bot marker exists", async () =>
   const marker = "<!-- cross-repo-perf:9988 -->";
   const fixture = makeCommentGithub([
     { id: 10, user: { login: "reviewer" }, body: `${marker}\nforged` },
+    {
+      id: 11,
+      user: { login: "github-actions[bot]" },
+      body: `unrelated report quoting ${marker} in the middle`,
+    },
   ]);
   const result = await upsertBotComment({
     github: fixture.github,

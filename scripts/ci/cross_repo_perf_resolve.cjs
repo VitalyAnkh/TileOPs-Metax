@@ -291,7 +291,7 @@ async function upsertBotComment({ github, owner, repo, issueNumber, marker, body
       comment.user &&
       comment.user.login === "github-actions[bot]" &&
       typeof comment.body === "string" &&
-      comment.body.includes(marker),
+      comment.body.startsWith(`${marker}\n`),
   );
   if (existing) {
     const response = await github.rest.issues.updateComment({
