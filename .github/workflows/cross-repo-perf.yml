@@ -1,0 +1,733 @@
+name: Cross-Repository Performance
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      disposition: ${{ steps.resolve.outputs.disposition }}
+      run_id: ${{ steps.resolve.outputs.run_id }}
+      run_attempt: ${{ steps.resolve.outputs.run_attempt }}
+      trigger_comment_id: ${{ steps.resolve.outputs.trigger_comment_id }}
+      tileops_repository: ${{ steps.resolve.outputs.tileops_repository }}
+      tileops_pr_number: ${{ steps.resolve.outputs.tileops_pr_number }}
+      tileops_default_sha: ${{ steps.resolve.outputs.tileops_default_sha }}
+      tileops_merge_sha: ${{ steps.resolve.outputs.tileops_merge_sha }}
+      tilelang_repository: ${{ steps.resolve.outputs.tilelang_repository }}
+      tilelang_default_sha: ${{ steps.resolve.outputs.tilelang_default_sha }}
+      tilelang_merge_sha: ${{ steps.resolve.outputs.tilelang_merge_sha }}
+      resolution_artifact_id: ${{ steps.resolution_upload.outputs.artifact-id }}
+      resolution_artifact_url: ${{ steps.resolution_upload.outputs.artifact-url }}
+      resolution_artifact_digest: ${{ steps.resolution_upload.outputs.artifact-digest }}
+      resolution_artifact_name: cross-repo-perf-resolution-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout trusted resolver
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          path: trusted-resolver
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable pull request identities
+        id: resolve
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          TRUSTED_ROOT: ${{ github.workspace }}/trusted-resolver
+          RESOLUTION_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ github.run_id }}/${{ github.run_attempt }}/resolution
+        with:
+          script: |
+            const crypto = require("crypto");
+            const fs = require("fs");
+            const path = require("path");
+            const trustedRoot = process.env.TRUSTED_ROOT;
+            const harnessPath = path.join(
+              trustedRoot,
+              "scripts/ci/cross_repo_perf_harness.py",
+            );
+            const harnessSha256 = crypto
+              .createHash("sha256")
+              .update(fs.readFileSync(harnessPath))
+              .digest("hex");
+            const { resolveRequest } = require(
+              path.join(trustedRoot, "scripts/ci/cross_repo_perf_resolve.cjs"),
+            );
+            const resolved = await resolveRequest({
+              github,
+              context,
+              body: context.payload.comment.body,
+              harnessSha256,
+            });
+            fs.mkdirSync(process.env.RESOLUTION_ROOT, {
+              recursive: true,
+              mode: 0o700,
+            });
+            fs.writeFileSync(
+              path.join(process.env.RESOLUTION_ROOT, "resolved.json"),
+              `${JSON.stringify(resolved)}\n`,
+              { encoding: "utf8", mode: 0o600 },
+            );
+            core.setOutput("disposition", resolved.disposition);
+            core.setOutput("run_id", resolved.run_id || "");
+            core.setOutput("run_attempt", resolved.run_attempt || "");
+            core.setOutput("trigger_comment_id", resolved.trigger_comment_id || "");
+            core.setOutput("tileops_repository", resolved.tileops?.repository || "");
+            core.setOutput("tileops_pr_number", resolved.tileops?.pr_number || "");
+            core.setOutput("tileops_default_sha", resolved.tileops?.default_sha || "");
+            core.setOutput("tileops_merge_sha", resolved.tileops?.merge_sha || "");
+            core.setOutput("tilelang_repository", resolved.tilelang?.repository || "");
+            core.setOutput("tilelang_default_sha", resolved.tilelang?.default_sha || "");
+            core.setOutput("tilelang_merge_sha", resolved.tilelang?.merge_sha || "");
+
+      - name: Upload resolution evidence
+        id: resolution_upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cross-repo-perf-resolution-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cross-repo-perf/${{ github.run_id }}/${{ github.run_attempt }}/resolution/resolved.json
+          if-no-files-found: error
+          retention-days: 14
+
+  benchmark:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.disposition == 'run' }}
+    runs-on: tileops-metax-runner
+    timeout-minutes: 300
+    concurrency:
+      group: cross-repo-perf-benchmark-${{ github.event.issue.number }}
+      cancel-in-progress: true
+    permissions:
+      contents: read
+    outputs:
+      baseline_artifact_id: ${{ steps.baseline_upload.outputs.artifact-id }}
+      baseline_artifact_url: ${{ steps.baseline_upload.outputs.artifact-url }}
+      baseline_artifact_digest: ${{ steps.baseline_upload.outputs.artifact-digest }}
+      baseline_artifact_name: cross-repo-perf-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+      candidate_artifact_id: ${{ steps.candidate_upload.outputs.artifact-id }}
+      candidate_artifact_url: ${{ steps.candidate_upload.outputs.artifact-url }}
+      candidate_artifact_digest: ${{ steps.candidate_upload.outputs.artifact-digest }}
+      candidate_artifact_name: cross-repo-perf-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Download exact resolution artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.resolution_artifact_id }}
+          path: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}/resolution
+          merge-multiple: true
+
+      - name: Checkout trusted TileOps tooling
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ needs.resolve.outputs.tileops_repository }}
+          ref: ${{ needs.resolve.outputs.tileops_default_sha }}
+          path: trusted-tileops
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout baseline TileOps source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ needs.resolve.outputs.tileops_repository }}
+          ref: ${{ needs.resolve.outputs.tileops_default_sha }}
+          path: baseline-tileops
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout baseline TileLang source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ needs.resolve.outputs.tilelang_repository }}
+          ref: ${{ needs.resolve.outputs.tilelang_default_sha }}
+          path: baseline-tilelang
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Bootstrap pinned uv and CPython 3.10
+        id: toolchain
+        shell: bash
+        env:
+          TRUSTED_SOURCE: ${{ github.workspace }}/trusted-tileops
+          RUN_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUN_ROOT/bootstrap-home" "$RUN_ROOT/bootstrap-tmp"
+          toolchain_json=$(
+            /usr/bin/env -i \
+              PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+              LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+              HOME="$RUN_ROOT/bootstrap-home" TMPDIR="$RUN_ROOT/bootstrap-tmp" \
+              PYTHONPATH='' PYTHONNOUSERSITE=1 \
+              HTTP_PROXY="${HTTP_PROXY:-}" HTTPS_PROXY="${HTTPS_PROXY:-}" \
+              NO_PROXY="${NO_PROXY:-}" \
+              python3 "$TRUSTED_SOURCE/scripts/cross_repo_perf_runtime.py" bootstrap-toolchain \
+                --lock "$TRUSTED_SOURCE/scripts/ci/cross_repo_perf_toolchain.lock" \
+                --root "$RUN_ROOT/toolchain" \
+                --provenance "$RUN_ROOT/toolchain-provenance.json"
+          )
+          PINNED_UV=$(TOOLCHAIN_JSON="$toolchain_json" PYTHONPATH='' PYTHONNOUSERSITE=1 \
+            /usr/bin/python3 -c 'import json, os; print(json.loads(os.environ["TOOLCHAIN_JSON"])["uv"])')
+          PINNED_PYTHON=$(TOOLCHAIN_JSON="$toolchain_json" PYTHONPATH='' PYTHONNOUSERSITE=1 \
+            /usr/bin/python3 -c 'import json, os; print(json.loads(os.environ["TOOLCHAIN_JSON"])["python"])')
+          PINNED_PYTHON_INCLUDE=$(TOOLCHAIN_JSON="$toolchain_json" PYTHONPATH='' PYTHONNOUSERSITE=1 \
+            /usr/bin/python3 -c 'import json, os; print(json.loads(os.environ["TOOLCHAIN_JSON"])["include"])')
+          [[ $PINNED_UV == /* && -x $PINNED_UV ]]
+          [[ $PINNED_PYTHON == /* && -x $PINNED_PYTHON ]]
+          [[ $PINNED_PYTHON_INCLUDE == /* && -f $PINNED_PYTHON_INCLUDE/Python.h ]]
+          {
+            echo "uv=$PINNED_UV"
+            echo "python=$PINNED_PYTHON"
+            echo "python_include=$PINNED_PYTHON_INCLUDE"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Build one trusted benchmark payload
+        id: trusted_payload
+        shell: bash
+        env:
+          PINNED_PYTHON: ${{ steps.toolchain.outputs.python }}
+          RUN_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}
+          PYTHONPATH: ""
+          PYTHONNOUSERSITE: "1"
+          LD_PRELOAD: ""
+        run: |
+          set -euo pipefail
+          PAYLOAD_ROOT="$RUN_ROOT/trusted-payload"
+          PAYLOAD_MANIFEST="$RUN_ROOT/trusted-payload.json"
+          "$PINNED_PYTHON" "${{ github.workspace }}/trusted-tileops/scripts/ci/cross_repo_perf_harness.py" build-payload \
+            --baseline-root "${{ github.workspace }}/trusted-tileops" \
+            --payload-root "$PAYLOAD_ROOT" \
+            --resolved "$RUN_ROOT/resolution/resolved.json" \
+            --result "$PAYLOAD_MANIFEST"
+          {
+            echo "root=$PAYLOAD_ROOT"
+            echo "manifest=$PAYLOAD_MANIFEST"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Materialize locked runtime and trusted MACA environment
+        id: runtime
+        shell: bash
+        env:
+          PINNED_PYTHON: ${{ steps.toolchain.outputs.python }}
+          TRUSTED_SOURCE: ${{ github.workspace }}/trusted-tileops
+          RUN_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}
+          PYTHONPATH: ""
+          PYTHONNOUSERSITE: "1"
+          LD_PRELOAD: ""
+        run: |
+          set -euo pipefail
+          PLATFORM_JSON="$RUN_ROOT/maca-environment.json"
+          WHEELHOUSE="$RUN_ROOT/wheelhouse"
+          "$PINNED_PYTHON" "$TRUSTED_SOURCE/scripts/cross_repo_perf_runtime.py" resolve-maca-environment \
+            --maca-path /opt/maca \
+            --driver-library /opt/mxdriver/lib \
+            --system-path /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            --output "$PLATFORM_JSON"
+          "$PINNED_PYTHON" "$TRUSTED_SOURCE/scripts/cross_repo_perf_runtime.py" materialize-wheelhouse \
+            --lock "$TRUSTED_SOURCE/scripts/ci/cross_repo_perf_py310.lock" \
+            --wheelhouse "$WHEELHOUSE"
+          "$PINNED_PYTHON" "$TRUSTED_SOURCE/scripts/cross_repo_perf_runtime.py" freeze-wheelhouse \
+            --wheelhouse "$WHEELHOUSE"
+          "$PINNED_PYTHON" "$TRUSTED_SOURCE/scripts/cross_repo_perf_runtime.py" verify-wheelhouse \
+            --lock "$TRUSTED_SOURCE/scripts/ci/cross_repo_perf_py310.lock" \
+            --wheelhouse "$WHEELHOUSE"
+          MACA_PATH_VALUE=$("$PINNED_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["maca_path"])' "$PLATFORM_JSON")
+          MACA_LIBRARY_PATH=$("$PINNED_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["library_path"])' "$PLATFORM_JSON")
+          SYSTEM_PATH=$("$PINNED_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["system_path"])' "$PLATFORM_JSON")
+          TILELANG_MXCC_FLAGS=$("$PINNED_PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1]))["tilelang_mxcc_flags"])' "$PLATFORM_JSON")
+          {
+            echo "wheelhouse=$WHEELHOUSE"
+            echo "maca_path=$MACA_PATH_VALUE"
+            echo "maca_library_path=$MACA_LIBRARY_PATH"
+            echo "system_path=$SYSTEM_PATH"
+            echo "tilelang_mxcc_flags=$TILELANG_MXCC_FLAGS"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Run baseline pair
+        id: baseline_pair
+        continue-on-error: true
+        shell: bash
+        env:
+          PINNED_UV: ${{ steps.toolchain.outputs.uv }}
+          PINNED_PYTHON: ${{ steps.toolchain.outputs.python }}
+          PINNED_PYTHON_INCLUDE: ${{ steps.toolchain.outputs.python_include }}
+          WHEELHOUSE: ${{ steps.runtime.outputs.wheelhouse }}
+          MACA_PATH_VALUE: ${{ steps.runtime.outputs.maca_path }}
+          MACA_LIBRARY_PATH: ${{ steps.runtime.outputs.maca_library_path }}
+          SYSTEM_PATH: ${{ steps.runtime.outputs.system_path }}
+          TILELANG_MXCC_FLAGS: ${{ steps.runtime.outputs.tilelang_mxcc_flags }}
+          RUN_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash "${{ github.workspace }}/trusted-tileops/scripts/ci/run_cross_repo_perf_pair.sh" \
+            --pair baseline \
+            --pair-root "$RUN_ROOT/baseline" \
+            --trusted-source "${{ github.workspace }}/trusted-tileops" \
+            --tileops-source "${{ github.workspace }}/baseline-tileops" \
+            --tileops-sha "${{ needs.resolve.outputs.tileops_default_sha }}" \
+            --tilelang-source "${{ github.workspace }}/baseline-tilelang" \
+            --tilelang-sha "${{ needs.resolve.outputs.tilelang_default_sha }}" \
+            --trusted-tileops-sha "${{ needs.resolve.outputs.tileops_default_sha }}" \
+            --resolved "$RUN_ROOT/resolution/resolved.json" \
+            --runtime-tool "${{ github.workspace }}/trusted-tileops/scripts/cross_repo_perf_runtime.py" \
+            --harness-tool "${{ github.workspace }}/trusted-tileops/scripts/ci/cross_repo_perf_harness.py" \
+            --runtime-lock "${{ github.workspace }}/trusted-tileops/scripts/ci/cross_repo_perf_py310.lock" \
+            --wheelhouse "$WHEELHOUSE" \
+            --uv "$PINNED_UV" \
+            --python "$PINNED_PYTHON" \
+            --python-include "$PINNED_PYTHON_INCLUDE" \
+            --git /usr/bin/git \
+            --repository "${{ needs.resolve.outputs.tileops_repository }}" \
+            --run-id "${{ needs.resolve.outputs.run_id }}" \
+            --run-attempt "${{ needs.resolve.outputs.run_attempt }}" \
+            --system-path "$SYSTEM_PATH" \
+            --maca-path "$MACA_PATH_VALUE" \
+            --maca-library-path "$MACA_LIBRARY_PATH" \
+            --tilelang-mxcc-flags "$TILELANG_MXCC_FLAGS" \
+            --payload-root "${{ steps.trusted_payload.outputs.root }}" \
+            --payload-manifest "${{ steps.trusted_payload.outputs.manifest }}"
+
+      - name: Upload baseline evidence
+        id: baseline_upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cross-repo-perf-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}/baseline/artifact
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Checkout candidate TileOps source
+        id: candidate_tileops
+        if: ${{ always() && steps.baseline_upload.outcome == 'success' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ needs.resolve.outputs.tileops_repository }}
+          ref: ${{ needs.resolve.outputs.tileops_merge_sha }}
+          path: candidate-tileops
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout candidate TileLang source
+        id: candidate_tilelang
+        if: ${{ always() && steps.baseline_upload.outcome == 'success' }}
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ needs.resolve.outputs.tilelang_repository }}
+          ref: ${{ needs.resolve.outputs.tilelang_merge_sha }}
+          path: candidate-tilelang
+          fetch-depth: 1
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Run candidate pair
+        id: candidate_pair
+        if: ${{ always() && steps.baseline_upload.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          PINNED_UV: ${{ steps.toolchain.outputs.uv }}
+          PINNED_PYTHON: ${{ steps.toolchain.outputs.python }}
+          PINNED_PYTHON_INCLUDE: ${{ steps.toolchain.outputs.python_include }}
+          WHEELHOUSE: ${{ steps.runtime.outputs.wheelhouse }}
+          MACA_PATH_VALUE: ${{ steps.runtime.outputs.maca_path }}
+          MACA_LIBRARY_PATH: ${{ steps.runtime.outputs.maca_library_path }}
+          SYSTEM_PATH: ${{ steps.runtime.outputs.system_path }}
+          TILELANG_MXCC_FLAGS: ${{ steps.runtime.outputs.tilelang_mxcc_flags }}
+          RUN_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          bash "${{ github.workspace }}/trusted-tileops/scripts/ci/run_cross_repo_perf_pair.sh" \
+            --pair candidate \
+            --pair-root "$RUN_ROOT/candidate" \
+            --trusted-source "${{ github.workspace }}/trusted-tileops" \
+            --tileops-source "${{ github.workspace }}/candidate-tileops" \
+            --tileops-sha "${{ needs.resolve.outputs.tileops_merge_sha }}" \
+            --tilelang-source "${{ github.workspace }}/candidate-tilelang" \
+            --tilelang-sha "${{ needs.resolve.outputs.tilelang_merge_sha }}" \
+            --trusted-tileops-sha "${{ needs.resolve.outputs.tileops_default_sha }}" \
+            --resolved "$RUN_ROOT/resolution/resolved.json" \
+            --runtime-tool "${{ github.workspace }}/trusted-tileops/scripts/cross_repo_perf_runtime.py" \
+            --harness-tool "${{ github.workspace }}/trusted-tileops/scripts/ci/cross_repo_perf_harness.py" \
+            --runtime-lock "${{ github.workspace }}/trusted-tileops/scripts/ci/cross_repo_perf_py310.lock" \
+            --wheelhouse "$WHEELHOUSE" \
+            --uv "$PINNED_UV" \
+            --python "$PINNED_PYTHON" \
+            --python-include "$PINNED_PYTHON_INCLUDE" \
+            --git /usr/bin/git \
+            --repository "${{ needs.resolve.outputs.tileops_repository }}" \
+            --run-id "${{ needs.resolve.outputs.run_id }}" \
+            --run-attempt "${{ needs.resolve.outputs.run_attempt }}" \
+            --system-path "$SYSTEM_PATH" \
+            --maca-path "$MACA_PATH_VALUE" \
+            --maca-library-path "$MACA_LIBRARY_PATH" \
+            --tilelang-mxcc-flags "$TILELANG_MXCC_FLAGS" \
+            --payload-root "${{ steps.trusted_payload.outputs.root }}" \
+            --payload-manifest "${{ steps.trusted_payload.outputs.manifest }}"
+
+      - name: Record candidate suppression
+        id: candidate_suppressed
+        if: ${{ always() && steps.baseline_upload.outcome != 'success' }}
+        shell: bash
+        env:
+          RUN_ROOT: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}
+        run: |
+          set -euo pipefail
+          started_at=$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)
+          /usr/bin/env -i \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            LANG=C.UTF-8 LC_ALL=C.UTF-8 PYTHONPATH='' PYTHONNOUSERSITE=1 \
+            /usr/bin/python3 "${{ github.workspace }}/trusted-tileops/scripts/cross_repo_perf_runtime.py" finalize-pair \
+            --artifact-root "$RUN_ROOT/candidate/artifact" \
+            --resolved "$RUN_ROOT/resolution/resolved.json" \
+            --repository "${{ needs.resolve.outputs.tileops_repository }}" \
+            --pair candidate \
+            --state skipped \
+            --phase suppressed \
+            --exit-code 0 \
+            --reason baseline_artifact_unavailable \
+            --started-at "$started_at" \
+            --finished-at "$(/usr/bin/date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --run-id "${{ needs.resolve.outputs.run_id }}" \
+            --run-attempt "${{ needs.resolve.outputs.run_attempt }}" \
+            --tileops-sha "${{ needs.resolve.outputs.tileops_merge_sha }}" \
+            --tilelang-sha "${{ needs.resolve.outputs.tilelang_merge_sha }}" \
+            --payload-manifest "${{ steps.trusted_payload.outputs.manifest }}"
+
+      - name: Upload candidate evidence
+        id: candidate_upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cross-repo-perf-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cross-repo-perf/${{ needs.resolve.outputs.run_id }}/${{ needs.resolve.outputs.run_attempt }}/candidate/artifact
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Adjudicate benchmark evidence
+        if: ${{ always() }}
+        shell: bash
+        env:
+          BASELINE_PAIR: ${{ steps.baseline_pair.outcome }}
+          BASELINE_UPLOAD: ${{ steps.baseline_upload.outcome }}
+          CANDIDATE_PAIR: ${{ steps.candidate_pair.outcome }}
+          CANDIDATE_SUPPRESSED: ${{ steps.candidate_suppressed.outcome }}
+          CANDIDATE_UPLOAD: ${{ steps.candidate_upload.outcome }}
+        run: |
+          set -euo pipefail
+          [[ $BASELINE_PAIR == success ]]
+          [[ $BASELINE_UPLOAD == success ]]
+          [[ $CANDIDATE_PAIR == success ]]
+          [[ $CANDIDATE_SUPPRESSED == skipped ]]
+          [[ $CANDIDATE_UPLOAD == success ]]
+
+  report:
+    needs: [resolve, benchmark]
+    if: ${{ always() && needs.resolve.result == 'success' && needs.resolve.outputs.disposition != 'ignore' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    outputs:
+      report_artifact_id: ${{ steps.report_upload.outputs.artifact-id }}
+      report_artifact_url: ${{ steps.report_upload.outputs.artifact-url }}
+      report_artifact_digest: ${{ steps.report_upload.outputs.artifact-digest }}
+      report_artifact_name: cross-repo-perf-report-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - name: Checkout immutable reporting code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.resolve.outputs.tileops_default_sha || github.sha }}
+          path: report-source
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Download exact resolution artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.resolve.outputs.resolution_artifact_id }}
+          path: ${{ runner.temp }}/cross-repo-perf-report/resolution
+          merge-multiple: true
+
+      - name: Verify Actions service artifact identities
+        id: service_audit
+        if: ${{ needs.resolve.outputs.disposition == 'run' }}
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          EVIDENCE_PATH: ${{ runner.temp }}/cross-repo-perf-report/report/service-evidence.json
+          EXPECTED_REPOSITORY: ${{ github.repository }}
+          EXPECTED_RUN_ID: ${{ needs.resolve.outputs.run_id }}
+          EXPECTED_RUN_ATTEMPT: ${{ needs.resolve.outputs.run_attempt }}
+          RESOLUTION_ID: ${{ needs.resolve.outputs.resolution_artifact_id }}
+          RESOLUTION_NAME: ${{ needs.resolve.outputs.resolution_artifact_name }}
+          RESOLUTION_DIGEST: ${{ needs.resolve.outputs.resolution_artifact_digest }}
+          BASELINE_ID: ${{ needs.benchmark.outputs.baseline_artifact_id }}
+          BASELINE_NAME: ${{ needs.benchmark.outputs.baseline_artifact_name }}
+          BASELINE_DIGEST: ${{ needs.benchmark.outputs.baseline_artifact_digest }}
+          CANDIDATE_ID: ${{ needs.benchmark.outputs.candidate_artifact_id }}
+          CANDIDATE_NAME: ${{ needs.benchmark.outputs.candidate_artifact_name }}
+          CANDIDATE_DIGEST: ${{ needs.benchmark.outputs.candidate_artifact_digest }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const { owner, repo } = context.repo;
+            const runId = Number(process.env.EXPECTED_RUN_ID);
+            const runAttempt = Number(process.env.EXPECTED_RUN_ATTEMPT);
+            const normalizeDigest = (value) =>
+              value.startsWith("sha256:") ? value : `sha256:${value}`;
+            const expectedFor = (prefix) => ({
+              schema_version: 1,
+              repository: process.env.EXPECTED_REPOSITORY,
+              run_id: runId,
+              run_attempt: runAttempt,
+              name: process.env[`${prefix}_NAME`],
+              artifact_id: Number(process.env[`${prefix}_ID`]),
+              artifact_digest: normalizeDigest(process.env[`${prefix}_DIGEST`]),
+              expired: false,
+            });
+            const inspect = async (expected) => {
+              if (!Number.isSafeInteger(expected.artifact_id) || expected.artifact_id <= 0) {
+                throw new Error("missing exact artifact ID");
+              }
+              const { data: artifact } = await github.rest.actions.getArtifact({
+                owner,
+                repo,
+                artifact_id: expected.artifact_id,
+              });
+              if (!artifact.workflow_run || artifact.workflow_run.id !== runId) {
+                throw new Error("artifact workflow_run.id mismatch");
+              }
+              const { data: workflowRun } = await github.rest.actions.getWorkflowRun({
+                owner,
+                repo,
+                run_id: artifact.workflow_run.id,
+              });
+              const { data: repository } = await github.rest.repos.get({ owner, repo });
+              const record = {
+                schema_version: 1,
+                repository: repository.full_name,
+                run_id: artifact.workflow_run.id,
+                run_attempt: workflowRun.run_attempt,
+                name: artifact.name,
+                artifact_id: artifact.id,
+                artifact_digest: artifact.digest,
+                expired: artifact.expired,
+              };
+              for (const key of Object.keys(expected)) {
+                if (record[key] !== expected[key]) {
+                  throw new Error(`artifact ${key} mismatch`);
+                }
+              }
+              return { record, expected };
+            };
+            const evidence = { schema_version: 1 };
+            for (const [name, prefix] of [
+              ["resolution", "RESOLUTION"],
+              ["baseline", "BASELINE"],
+              ["candidate", "CANDIDATE"],
+            ]) {
+              evidence[name] = await inspect(expectedFor(prefix));
+            }
+            fs.mkdirSync(path.dirname(process.env.EVIDENCE_PATH), {
+              recursive: true,
+              mode: 0o700,
+            });
+            fs.writeFileSync(
+              process.env.EVIDENCE_PATH,
+              `${JSON.stringify(evidence)}\n`,
+              { encoding: "utf8", mode: 0o600 },
+            );
+
+      - name: Download exact baseline artifact
+        id: baseline_download
+        if: ${{ always() && needs.resolve.outputs.disposition == 'run' && steps.service_audit.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.benchmark.outputs.baseline_artifact_id }}
+          path: ${{ runner.temp }}/cross-repo-perf-report/baseline
+          merge-multiple: true
+
+      - name: Download exact candidate artifact
+        id: candidate_download
+        if: ${{ always() && needs.resolve.outputs.disposition == 'run' && steps.service_audit.outcome == 'success' }}
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.benchmark.outputs.candidate_artifact_id }}
+          path: ${{ runner.temp }}/cross-repo-perf-report/candidate
+          merge-multiple: true
+
+      - name: Render verified comparison
+        id: comparison
+        if: ${{ always() && needs.resolve.outputs.disposition == 'run' && steps.service_audit.outcome == 'success' && steps.baseline_download.outcome == 'success' && steps.candidate_download.outcome == 'success' }}
+        continue-on-error: true
+        shell: bash
+        env:
+          REPORT_SOURCE: ${{ github.workspace }}/report-source
+          REPORT_ROOT: ${{ runner.temp }}/cross-repo-perf-report/report
+          RESOLVED: ${{ runner.temp }}/cross-repo-perf-report/resolution/resolved.json
+          BASELINE: ${{ runner.temp }}/cross-repo-perf-report/baseline
+          CANDIDATE: ${{ runner.temp }}/cross-repo-perf-report/candidate
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$REPORT_ROOT"
+          cd "$REPORT_SOURCE"
+          set +e
+          PYTHONPATH="$REPORT_SOURCE" PYTHONNOUSERSITE=1 python3 -m scripts.cross_repo_perf_report \
+            --resolved "$RESOLVED" \
+            --service-evidence "$REPORT_ROOT/service-evidence.json" \
+            --baseline-dir "$BASELINE" \
+            --candidate-dir "$CANDIDATE" \
+            --run-url "$RUN_URL" \
+            --artifact-url "$RUN_URL#artifacts" \
+            --output-markdown "$REPORT_ROOT/report.md" \
+            --output-comment "$REPORT_ROOT/comment.md" \
+            --output-json "$REPORT_ROOT/comparison.json"
+          status=$?
+          set -e
+          if [[ -f $REPORT_ROOT/report.md && -f $REPORT_ROOT/comment.md && -f $REPORT_ROOT/comparison.json ]]; then
+            echo "rendered=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "rendered=false" >>"$GITHUB_OUTPUT"
+          fi
+          exit "$status"
+
+      - name: Render rejection or infrastructure report
+        id: fallback
+        if: ${{ always() && (needs.resolve.outputs.disposition == 'reject' || steps.comparison.outputs.rendered != 'true') }}
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          RESOLVED: ${{ runner.temp }}/cross-repo-perf-report/resolution/resolved.json
+          REPORT_ROOT: ${{ runner.temp }}/cross-repo-perf-report/report
+          DISPOSITION: ${{ needs.resolve.outputs.disposition }}
+          BENCHMARK_RESULT: ${{ needs.benchmark.result }}
+          SERVICE_AUDIT: ${{ steps.service_audit.outcome }}
+          BASELINE_DOWNLOAD: ${{ steps.baseline_download.outcome }}
+          CANDIDATE_DOWNLOAD: ${{ steps.candidate_download.outcome }}
+          COMPARISON: ${{ steps.comparison.outcome }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const resolved = JSON.parse(fs.readFileSync(process.env.RESOLVED, "utf8"));
+            const marker = `<!-- cross-repo-perf:trigger-comment-${context.payload.comment.id} -->`;
+            let body;
+            if (process.env.DISPOSITION === "reject") {
+              body = [
+                "# Cross-Repository Performance",
+                "",
+                `Request rejected: ${resolved.reason}`,
+                "",
+              ].join("\n");
+            } else {
+              body = [
+                "# Cross-Repository Performance",
+                "",
+                "A verified comparison could not be produced.",
+                "",
+                `- Benchmark job: \`${process.env.BENCHMARK_RESULT}\``,
+                `- Artifact service audit: \`${process.env.SERVICE_AUDIT}\``,
+                `- Baseline download: \`${process.env.BASELINE_DOWNLOAD}\``,
+                `- Candidate download: \`${process.env.CANDIDATE_DOWNLOAD}\``,
+                `- Comparison: \`${process.env.COMPARISON}\``,
+                "",
+              ].join("\n");
+            }
+            fs.mkdirSync(process.env.REPORT_ROOT, { recursive: true, mode: 0o700 });
+            fs.writeFileSync(
+              path.join(process.env.REPORT_ROOT, "comment.md"),
+              `${marker}\n${body}`,
+              { encoding: "utf8", mode: 0o600 },
+            );
+            fs.writeFileSync(
+              path.join(process.env.REPORT_ROOT, "report.md"),
+              body,
+              { encoding: "utf8", mode: 0o600 },
+            );
+            fs.writeFileSync(
+              path.join(process.env.REPORT_ROOT, "comparison.json"),
+              `${JSON.stringify({
+                schema_version: 1,
+                disposition: process.env.DISPOSITION,
+                reason: resolved.reason || "verified comparison unavailable",
+              })}\n`,
+              { encoding: "utf8", mode: 0o600 },
+            );
+
+      - name: Publish pull request report
+        id: publish
+        if: ${{ always() && (steps.comparison.outputs.rendered == 'true' || steps.fallback.outcome == 'success') }}
+        continue-on-error: true
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        env:
+          TRUSTED_ROOT: ${{ github.workspace }}/report-source
+          COMMENT_PATH: ${{ runner.temp }}/cross-repo-perf-report/report/comment.md
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const marker = `<!-- cross-repo-perf:trigger-comment-${context.payload.comment.id} -->`;
+            const rendered = fs.readFileSync(process.env.COMMENT_PATH, "utf8");
+            if (!rendered.startsWith(`${marker}\n`)) {
+              throw new Error("report comment marker mismatch");
+            }
+            const { upsertBotComment } = require(
+              path.join(process.env.TRUSTED_ROOT, "scripts/ci/cross_repo_perf_resolve.cjs"),
+            );
+            await upsertBotComment({
+              github,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issueNumber: context.issue.number,
+              marker,
+              body: rendered.slice(marker.length + 1),
+            });
+
+      - name: Upload full report
+        id: report_upload
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: cross-repo-perf-report-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cross-repo-perf-report/report
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Adjudicate reporting outcome
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DISPOSITION: ${{ needs.resolve.outputs.disposition }}
+          BENCHMARK_RESULT: ${{ needs.benchmark.result }}
+          SERVICE_AUDIT: ${{ steps.service_audit.outcome }}
+          BASELINE_DOWNLOAD: ${{ steps.baseline_download.outcome }}
+          CANDIDATE_DOWNLOAD: ${{ steps.candidate_download.outcome }}
+          COMPARISON: ${{ steps.comparison.outcome }}
+          FALLBACK: ${{ steps.fallback.outcome }}
+          PUBLISH: ${{ steps.publish.outcome }}
+          REPORT_UPLOAD: ${{ steps.report_upload.outcome }}
+        run: |
+          set -euo pipefail
+          [[ $PUBLISH == success ]]
+          [[ $REPORT_UPLOAD == success ]]
+          if [[ $DISPOSITION == reject ]]; then
+            [[ $FALLBACK == success ]]
+            exit 1
+          fi
+          [[ $BENCHMARK_RESULT == success ]]
+          [[ $SERVICE_AUDIT == success ]]
+          [[ $BASELINE_DOWNLOAD == success ]]
+          [[ $CANDIDATE_DOWNLOAD == success ]]
+          [[ $COMPARISON == success ]]
+          [[ $FALLBACK == skipped ]]

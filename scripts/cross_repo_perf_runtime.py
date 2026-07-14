@@ -5,8 +5,11 @@ import argparse
 import configparser
 import hashlib
 import http.client
+import importlib
+import importlib.metadata
 import json
 import os
+import platform
 import posixpath
 import re
 import shutil
@@ -31,9 +34,17 @@ MAX_COLLECTION_NODEIDS = 10000
 MAX_GENERIC_ARRAY = 256
 MAX_NESTING_DEPTH = 8
 MAX_PYPI_JSON_BYTES = 8 * 1024 * 1024
+MAX_WHEEL_MEMBERS = 50_000
+MAX_WHEEL_MEMBER_BYTES = 2 * 1024 * 1024 * 1024
+MAX_WHEEL_EXPANDED_BYTES = 4 * 1024 * 1024 * 1024
+MAX_WHEEL_COMPRESSION_RATIO = 200
+MAX_WHEEL_CONTROL_BYTES = 64 * 1024
 HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 NAME_NORMALIZER_RE = re.compile(r"[-_.]+")
+DEFAULT_SYSTEM_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+UV_REDIRECT_HOST = "release-assets.githubusercontent.com"
+UV_REDIRECT_PATH = "/github-production-release-asset/699532645/793a881c-33ea-4189-9aaa-a65974e32cac"
 
 UV_URL = (
     "https://github.com/astral-sh/uv/releases/download/0.11.16/uv-x86_64-unknown-linux-gnu.tar.gz"
@@ -128,6 +139,7 @@ class WheelAudit:
     filename: str
     sha256: str
     size: int
+    install_paths: frozenset[str]
 
 
 @dataclass(frozen=True)
@@ -184,6 +196,12 @@ def _require_positive_int(value: object, context: str) -> int:
     return value
 
 
+def _require_nonnegative_int(value: object, context: str) -> int:
+    if not _is_int(value) or value < 0:
+        raise EvidenceError(f"{context} must be a non-negative integer")
+    return value
+
+
 def _require_sha256(value: object, context: str) -> str:
     if not isinstance(value, str) or not HASH_RE.fullmatch(value):
         raise EvidenceError(f"{context} must be a lowercase SHA-256")
@@ -218,20 +236,41 @@ def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object
 
 
 def _read_json(path: Path, max_bytes: int = MAX_JSON_BYTES) -> object:
+    _assert_no_symlink_components(path)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
     try:
-        size = path.stat().st_size
+        descriptor = os.open(path, flags)
     except OSError as error:
-        raise EvidenceError(f"cannot stat JSON file {path}: {error}") from error
-    if size > max_bytes:
-        raise EvidenceError(f"JSON file {path} exceeds the {max_bytes} byte size limit")
+        raise EvidenceError(f"cannot open JSON file {path}: {error}") from error
     try:
-        return json.loads(
-            path.read_text(encoding="utf-8"), object_pairs_hook=_reject_duplicate_pairs
-        )
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISREG(mode):
+            raise EvidenceError(f"JSON file is not a regular file: {path}")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > max_bytes:
+            raise EvidenceError(f"JSON file {path} exceeds the {max_bytes} byte size limit")
+        text = payload.decode("utf-8")
+        return json.loads(text, object_pairs_hook=_reject_duplicate_pairs)
     except EvidenceError:
         raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as error:
         raise EvidenceError(f"invalid JSON file {path}: {error}") from error
+    finally:
+        os.close(descriptor)
 
 
 def _json_bytes(value: object) -> bytes:
@@ -445,14 +484,34 @@ def _final_toolchain_url_allowed(expected: str, actual: str) -> bool:
     if expected == actual:
         return True
     parsed = urllib.parse.urlsplit(actual)
-    if parsed.scheme != "https" or not parsed.hostname:
+    if expected != UV_URL or parsed.scheme != "https":
         return False
-    return parsed.hostname in {
-        "release-assets.githubusercontent.com",
-        "objects.githubusercontent.com",
-        "github.com",
-        "releases.astral.sh",
+    return parsed.hostname == UV_REDIRECT_HOST and parsed.path == UV_REDIRECT_PATH
+
+
+def _trusted_subprocess_environment(temp_root: Path | None = None) -> dict[str, str]:
+    environment = {
+        "PATH": DEFAULT_SYSTEM_PATH,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONPATH": "",
+        "PYTHONNOUSERSITE": "1",
     }
+    if temp_root is not None:
+        if not temp_root.is_dir() or temp_root.is_symlink():
+            raise EvidenceError(f"trusted subprocess temp root is invalid: {temp_root}")
+        environment["TMPDIR"] = str(temp_root.resolve())
+    return environment
+
+
+def _trusted_c_compiler() -> str:
+    compiler = shutil.which("cc", path=DEFAULT_SYSTEM_PATH)
+    if compiler is None:
+        raise EvidenceError("trusted system C compiler was not found")
+    resolved = Path(compiler).resolve()
+    if not resolved.is_file() or not resolved.is_relative_to(Path("/usr").resolve()):
+        raise EvidenceError(f"trusted system C compiler resolved outside /usr: {resolved}")
+    return str(resolved)
 
 
 def _run_version(executable: Path) -> str:
@@ -463,6 +522,7 @@ def _run_version(executable: Path) -> str:
             capture_output=True,
             text=True,
             timeout=30,
+            env=_trusted_subprocess_environment(),
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise EvidenceError(f"cannot execute pinned tool {executable}: {error}") from error
@@ -479,18 +539,20 @@ def _compile_extension_probe(python: Path, include: Path, root: Path) -> dict[st
         "PyMODINIT_FUNC PyInit__cross_repo_perf_probe(void) { return PyModule_Create(&module); }\n",
         encoding="ascii",
     )
+    subprocess_environment = _trusted_subprocess_environment(probe_root)
     suffix_result = subprocess.run(
         [str(python), "-c", "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"],
         check=True,
         capture_output=True,
         text=True,
         timeout=30,
+        env=subprocess_environment,
     )
     suffix = suffix_result.stdout.strip()
     if not suffix.startswith("."):
         raise EvidenceError("pinned Python returned an invalid extension suffix")
     extension = probe_root / f"_cross_repo_perf_probe{suffix}"
-    compiler = os.environ.get("CC", "cc")
+    compiler = _trusted_c_compiler()
     try:
         subprocess.run(
             [compiler, "-shared", "-fPIC", f"-I{include}", str(source), "-o", str(extension)],
@@ -498,6 +560,7 @@ def _compile_extension_probe(python: Path, include: Path, root: Path) -> dict[st
             capture_output=True,
             text=True,
             timeout=120,
+            env=subprocess_environment,
         )
         subprocess.run(
             [
@@ -514,6 +577,7 @@ def _compile_extension_probe(python: Path, include: Path, root: Path) -> dict[st
             capture_output=True,
             text=True,
             timeout=30,
+            env=subprocess_environment,
         )
     except (OSError, subprocess.SubprocessError) as error:
         raise EvidenceError(f"pinned Python C-extension probe failed: {error}") from error
@@ -959,19 +1023,170 @@ def normalize_runtime_lock(
     return value
 
 
+def _validated_system_path(value: str) -> str:
+    if not value:
+        raise EvidenceError("system PATH must not be empty")
+    allowed_roots = tuple(Path(root).resolve() for root in ("/usr", "/bin", "/sbin", "/opt"))
+    entries: list[str] = []
+    for text in value.split(os.pathsep):
+        path = Path(text)
+        if not text or not path.is_absolute():
+            raise EvidenceError(f"system PATH contains a non-absolute entry: {text or '<empty>'}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise EvidenceError(f"system PATH entry cannot be resolved: {path}: {error}") from error
+        if not resolved.is_dir() or not any(
+            resolved == root or resolved.is_relative_to(root) for root in allowed_roots
+        ):
+            raise EvidenceError(f"system PATH entry is outside trusted roots: {resolved}")
+        lowered = resolved.as_posix().lower()
+        if any(
+            marker in lowered for marker in ("/conda", "/mamba", "/miniforge", "/venv", "/.venv")
+        ):
+            raise EvidenceError(f"system PATH contains a Python environment: {resolved}")
+        normalized = str(resolved)
+        if normalized not in entries:
+            entries.append(normalized)
+    return os.pathsep.join(entries)
+
+
+def _system_gcc_version() -> str:
+    compiler = shutil.which("gcc", path=DEFAULT_SYSTEM_PATH)
+    if compiler is None:
+        raise EvidenceError("trusted system GCC was not found")
+    resolved = Path(compiler).resolve(strict=True)
+    if not resolved.is_file() or not resolved.is_relative_to(Path("/usr").resolve()):
+        raise EvidenceError(f"trusted system GCC resolved outside /usr: {resolved}")
+    try:
+        completed = subprocess.run(
+            [str(resolved), "-dumpfullversion"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_trusted_subprocess_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise EvidenceError(f"cannot query trusted system GCC: {error}") from error
+    return completed.stdout.strip()
+
+
+def _canonical_directory_within(path: Path, *, trusted_roots: Sequence[Path], context: str) -> Path:
+    if not path.is_absolute():
+        raise EvidenceError(f"{context} must be an absolute path")
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as error:
+        raise EvidenceError(f"cannot resolve {context} {path}: {error}") from error
+    if not resolved.is_dir():
+        raise EvidenceError(f"{context} must be a directory: {resolved}")
+    roots: list[Path] = []
+    for root in trusted_roots:
+        if not root.is_absolute():
+            raise EvidenceError("trusted platform roots must be absolute")
+        try:
+            canonical_root = root.resolve(strict=True)
+        except OSError as error:
+            raise EvidenceError(f"cannot resolve trusted platform root {root}: {error}") from error
+        if not canonical_root.is_dir():
+            raise EvidenceError(f"trusted platform root must be a directory: {canonical_root}")
+        roots.append(canonical_root)
+    if not any(resolved == root or resolved.is_relative_to(root) for root in roots):
+        raise EvidenceError(f"{context} is outside trusted platform roots: {resolved}")
+    return resolved
+
+
+def resolve_maca_environment(
+    maca_path: Path,
+    *,
+    driver_library: Path | None = Path("/opt/mxdriver/lib"),
+    system_path: str = DEFAULT_SYSTEM_PATH,
+    trusted_roots: Sequence[Path] = (Path("/opt"),),
+    gcc_version_loader: Callable[[], str] = _system_gcc_version,
+) -> dict[str, object]:
+    maca = _canonical_directory_within(
+        maca_path, trusted_roots=trusted_roots, context="MACA installation"
+    )
+    for relative in ("include", "lib", "mxgpu_llvm/lib", "mxgpu_llvm/bin"):
+        _canonical_directory_within(
+            maca / relative,
+            trusted_roots=(maca,),
+            context=f"MACA {relative}",
+        )
+    mxcc = _checked_regular_file(
+        maca / "mxgpu_llvm/bin/mxcc", "MACA mxcc executable", allow_symlink=True
+    )
+    if not os.access(mxcc, os.X_OK):
+        raise EvidenceError(f"MACA mxcc is not executable: {mxcc}")
+
+    library_directories: list[Path] = []
+    optional_ompi = maca / "ompi/lib"
+    if optional_ompi.exists():
+        library_directories.append(
+            _canonical_directory_within(
+                optional_ompi, trusted_roots=(maca,), context="MACA OpenMPI library directory"
+            )
+        )
+    for relative in ("mxgpu_llvm/lib", "lib"):
+        library_directories.append(
+            _canonical_directory_within(
+                maca / relative,
+                trusted_roots=(maca,),
+                context=f"MACA {relative}",
+            )
+        )
+    if driver_library is not None:
+        library_directories.append(
+            _canonical_directory_within(
+                driver_library,
+                trusted_roots=trusted_roots,
+                context="MetaX driver library directory",
+            )
+        )
+
+    path_directories: list[Path] = []
+    optional_cu_bridge = maca / "tools/cu-bridge/bin"
+    if optional_cu_bridge.exists():
+        path_directories.append(
+            _canonical_directory_within(
+                optional_cu_bridge,
+                trusted_roots=(maca,),
+                context="MACA cu-bridge binary directory",
+            )
+        )
+    path_directories.append(
+        _canonical_directory_within(
+            maca / "mxgpu_llvm/bin",
+            trusted_roots=(maca,),
+            context="MACA compiler binary directory",
+        )
+    )
+    path_directories.extend(
+        Path(entry) for entry in _validated_system_path(system_path).split(os.pathsep)
+    )
+    unique_path_directories = list(dict.fromkeys(path_directories))
+    unique_library_directories = list(dict.fromkeys(library_directories))
+
+    gcc_version = gcc_version_loader().strip()
+    match = re.fullmatch(r"([1-9][0-9]*)(?:\.[0-9]+)*", gcc_version)
+    if match is None:
+        raise EvidenceError(f"trusted GCC returned an invalid version: {gcc_version!r}")
+    return {
+        "schema_version": 1,
+        "maca_path": str(maca),
+        "library_path": os.pathsep.join(str(path) for path in unique_library_directories),
+        "system_path": os.pathsep.join(str(path) for path in unique_path_directories),
+        "tilelang_mxcc_flags": f"-gcc-version {match.group(1)}",
+    }
+
+
 def make_pair_environment(pair_root: Path, inherited: Mapping[str, str]) -> dict[str, str]:
     _empty_directory(pair_root, "pair root")
-    blocked = {
-        "PYTHONHOME",
-        "VIRTUAL_ENV",
-        "CONDA_PREFIX",
-        "CONDA_DEFAULT_ENV",
-        "PIP_TARGET",
-        "PIP_PREFIX",
-        "PIP_USER",
-        "UV_PROJECT_ENVIRONMENT",
+    environment = {
+        key: value for key in ("LANG", "LC_ALL", "LC_CTYPE", "TZ") if (value := inherited.get(key))
     }
-    environment = {key: value for key, value in inherited.items() if key not in blocked}
+    environment["PATH"] = _validated_system_path(inherited.get("PATH", DEFAULT_SYSTEM_PATH))
     created: dict[str, Path] = {}
     for name in PAIR_PATH_VARIABLES:
         relative = _PAIR_PATH_NAMES[name]
@@ -985,6 +1200,7 @@ def make_pair_environment(pair_root: Path, inherited: Mapping[str, str]) -> dict
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
             "TILELANG_DISABLE_CACHE": "1",
             "PIP_NO_INDEX": "1",
+            "USE_MACA": "ON",
         }
     )
     root = pair_root.resolve()
@@ -1002,18 +1218,123 @@ def _safe_zip_name(name: str) -> PurePosixPath:
     return path
 
 
+def _wheel_install_path(member: PurePosixPath, distribution: str) -> str:
+    site_packages = PurePosixPath("lib/python3.10/site-packages")
+    parts = member.parts
+    if len(parts) >= 3 and parts[0].lower().endswith(".data"):
+        scheme = parts[1].lower()
+        prefixes = {
+            "purelib": site_packages,
+            "platlib": site_packages,
+            "scripts": PurePosixPath("bin"),
+            "data": PurePosixPath("."),
+            "headers": PurePosixPath("include/site/python3.10") / normalize_name(distribution),
+        }
+        try:
+            prefix = prefixes[scheme]
+        except KeyError as error:
+            raise EvidenceError(
+                f"wheel contains an unknown .data install scheme: {scheme}"
+            ) from error
+        target = posixpath.normpath(str(prefix / PurePosixPath(*parts[2:])))
+    else:
+        target = posixpath.normpath(str(site_packages / member))
+    if target == ".." or target.startswith("../") or target.startswith("/"):
+        raise EvidenceError(f"wheel install path escapes the environment: {member}")
+    return target
+
+
+def _wheel_member_is_regular(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0xFFFF
+    kind = stat.S_IFMT(mode)
+    if kind == 0:
+        return not info.is_dir()
+    return stat.S_ISREG(mode)
+
+
+def _wheel_member_is_directory(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0xFFFF
+    kind = stat.S_IFMT(mode)
+    if kind == 0:
+        return info.is_dir()
+    return stat.S_ISDIR(mode)
+
+
+def _owns_import_module(paths: Iterable[str], module: str) -> bool:
+    file_path = f"lib/python3.10/site-packages/{module}.py"
+    package_prefix = f"lib/python3.10/site-packages/{module}/"
+    return any(path == file_path or path.startswith(package_prefix) for path in paths)
+
+
+def _installs_top_level_dist_info(path: str) -> bool:
+    parts = PurePosixPath(path).parts
+    return (
+        len(parts) >= 4
+        and parts[:3] == ("lib", "python3.10", "site-packages")
+        and parts[3].lower().endswith(".dist-info")
+    )
+
+
 def audit_wheel(path: Path, expected_name: str) -> WheelAudit:
     if path.is_symlink() or not path.is_file():
         raise EvidenceError(f"wheel is not a regular file: {path}")
     metadata_entries: list[zipfile.ZipInfo] = []
     entry_points_entries: list[zipfile.ZipInfo] = []
     pth_entries: list[zipfile.ZipInfo] = []
+    install_paths: set[str] = set()
     try:
         with zipfile.ZipFile(path) as archive:
-            for info in archive.infolist():
+            infos = archive.infolist()
+            if len(infos) > MAX_WHEEL_MEMBERS:
+                raise EvidenceError(f"wheel contains more than {MAX_WHEEL_MEMBERS} members")
+            expanded_size = 0
+            archive_names: set[str] = set()
+            for info in infos:
                 member = _safe_zip_name(info.filename)
+                if info.filename in archive_names:
+                    raise EvidenceError(f"wheel contains duplicate member: {info.filename}")
+                archive_names.add(info.filename)
+                if info.flag_bits & 0x1:
+                    raise EvidenceError(f"wheel contains an encrypted member: {info.filename}")
+                if info.is_dir():
+                    if not _wheel_member_is_directory(info):
+                        raise EvidenceError(
+                            f"wheel directory has a special file type: {info.filename}"
+                        )
+                    continue
+                if not _wheel_member_is_regular(info):
+                    raise EvidenceError(f"wheel member is not a regular file: {info.filename}")
+                if info.file_size > MAX_WHEEL_MEMBER_BYTES:
+                    raise EvidenceError(
+                        f"wheel member expanded size exceeds 2 GiB: {info.filename}"
+                    )
+                expanded_size += info.file_size
+                if expanded_size > MAX_WHEEL_EXPANDED_BYTES:
+                    raise EvidenceError("wheel expanded size exceeds 4 GiB")
+                if info.file_size:
+                    if info.compress_size == 0:
+                        raise EvidenceError(
+                            f"wheel member has an invalid compression size: {info.filename}"
+                        )
+                    ratio = info.file_size / info.compress_size
+                    if ratio > MAX_WHEEL_COMPRESSION_RATIO:
+                        raise EvidenceError(
+                            f"wheel member compression ratio exceeds {MAX_WHEEL_COMPRESSION_RATIO}: "
+                            f"{info.filename}"
+                        )
+                installed = _wheel_install_path(member, expected_name)
+                archive_dist_info = member.parts[0].lower().endswith(".dist-info")
+                if _installs_top_level_dist_info(installed) and not archive_dist_info:
+                    raise EvidenceError(
+                        "wheel installs top-level .dist-info content through a .data scheme"
+                    )
+                if installed in install_paths:
+                    raise EvidenceError(f"wheel installs a duplicate path: {installed}")
+                install_paths.add(installed)
                 basename = member.name.lower()
                 if basename.endswith(".pth"):
+                    if info.file_size > MAX_WHEEL_CONTROL_BYTES:
+                        raise EvidenceError("wheel .pth control file exceeds 64 KiB")
                     pth_entries.append(info)
                 if basename == "sitecustomize.py":
                     raise EvidenceError(
@@ -1029,9 +1350,13 @@ def audit_wheel(path: Path, expected_name: str) -> WheelAudit:
                 if top_level_dist_info and basename == "metadata":
                     metadata_entries.append(info)
                 if top_level_dist_info and basename == "entry_points.txt":
+                    if info.file_size > MAX_WHEEL_CONTROL_BYTES:
+                        raise EvidenceError("wheel entry_points.txt control file exceeds 64 KiB")
                     entry_points_entries.append(info)
             if len(metadata_entries) != 1:
                 raise EvidenceError("wheel must contain exactly one METADATA file")
+            if metadata_entries[0].file_size > 1024 * 1024:
+                raise EvidenceError("wheel METADATA exceeds 1 MiB")
             metadata_text = archive.read(metadata_entries[0]).decode("utf-8")
             metadata = Parser().parsestr(metadata_text)
             name = metadata.get("Name")
@@ -1052,6 +1377,10 @@ def audit_wheel(path: Path, expected_name: str) -> WheelAudit:
                 )
                 if not allowed_setuptools_pth:
                     raise EvidenceError("wheel contains a forbidden .pth startup hook")
+                if not _owns_import_module(install_paths, "_distutils_hack"):
+                    raise EvidenceError(
+                        "setuptools startup hook target _distutils_hack is not owned by the wheel"
+                    )
             if len(entry_points_entries) > 1:
                 raise EvidenceError("wheel must contain at most one entry_points.txt file")
             for entry in entry_points_entries:
@@ -1066,6 +1395,10 @@ def audit_wheel(path: Path, expected_name: str) -> WheelAudit:
                     )
                     if not allowed_timeout_plugin:
                         raise EvidenceError("wheel declares a forbidden pytest11 entry point")
+                    if not _owns_import_module(install_paths, "pytest_timeout"):
+                        raise EvidenceError(
+                            "pytest-timeout entry point target is not owned by the wheel"
+                        )
     except EvidenceError:
         raise
     except (OSError, UnicodeError, zipfile.BadZipFile, configparser.Error) as error:
@@ -1076,7 +1409,46 @@ def audit_wheel(path: Path, expected_name: str) -> WheelAudit:
         filename=path.name,
         sha256=sha256_file(path),
         size=path.stat().st_size,
+        install_paths=frozenset(install_paths),
     )
+
+
+def _validate_wheel_audit_set(audits: Sequence[WheelAudit]) -> None:
+    path_owners: dict[str, tuple[str, str]] = {}
+    module_owners: dict[str, set[tuple[str, str]]] = {
+        "_distutils_hack": set(),
+        "pytest_timeout": set(),
+    }
+    for audit in audits:
+        owner = (audit.name, audit.version)
+        for install_path in audit.install_paths:
+            previous = path_owners.get(install_path)
+            if previous is not None and previous != owner:
+                raise EvidenceError(
+                    f"wheel install path collision for {install_path}: {previous[0]} and {audit.name}"
+                )
+            path_owners[install_path] = owner
+        for module in module_owners:
+            if _owns_import_module(audit.install_paths, module):
+                module_owners[module].add(owner)
+    expected_owners = {
+        "_distutils_hack": ("setuptools", "80.9.0"),
+        "pytest_timeout": ("pytest-timeout", "2.4.0"),
+    }
+    for module, owners in module_owners.items():
+        if owners and owners != {expected_owners[module]}:
+            names = ", ".join(sorted(name for name, _ in owners))
+            raise EvidenceError(
+                f"startup module ownership for {module} is invalid or multiple: {names}"
+            )
+
+
+def audit_wheel_set(wheels: Iterable[tuple[Path, str]]) -> list[WheelAudit]:
+    """Audit wheels together so no distribution can shadow another's files."""
+
+    audits = [audit_wheel(path, expected_name) for path, expected_name in wheels]
+    _validate_wheel_audit_set(audits)
+    return audits
 
 
 def select_wheel(paths: Iterable[Path], expected_name: str) -> WheelAudit:
@@ -1131,10 +1503,13 @@ def _validate_artifact_identity(value: object) -> dict[str, object]:
 
 
 def write_artifact_manifest(root: Path, output: Path, identity: Mapping[str, object]) -> None:
-    root = root.resolve()
-    output_parent = output.parent.resolve()
-    if not output_parent.is_relative_to(root):
-        raise EvidenceError("artifact manifest output must be inside the artifact root")
+    _assert_no_symlink_components(root)
+    root = root.absolute()
+    if not root.is_dir():
+        raise EvidenceError("artifact root must be a directory")
+    output = output.absolute()
+    if output != root / "artifact-manifest.json":
+        raise EvidenceError("artifact manifest must be root/artifact-manifest.json")
     validated_identity = _validate_artifact_identity(dict(identity))
     files = []
     for path in _walk_regular_files(root, {output}):
@@ -1154,7 +1529,13 @@ def write_artifact_manifest(root: Path, output: Path, identity: Mapping[str, obj
 def validate_artifact_manifest(
     root: Path, manifest_path: Path, expected: Mapping[str, object]
 ) -> None:
-    root = root.resolve()
+    _assert_no_symlink_components(root)
+    root = root.absolute()
+    if not root.is_dir():
+        raise EvidenceError("artifact root must be a directory")
+    manifest_path = manifest_path.absolute()
+    if manifest_path != root / "artifact-manifest.json":
+        raise EvidenceError("artifact manifest must be root/artifact-manifest.json")
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise EvidenceError("artifact manifest is not a regular file")
     value = _expect_dict(_read_json(manifest_path), "artifact manifest")
@@ -1176,7 +1557,7 @@ def validate_artifact_manifest(
         path_text = relative.as_posix()
         if path_text in recorded:
             raise EvidenceError(f"artifact manifest contains duplicate path: {path_text}")
-        _require_positive_int(entry["size"], f"artifact manifest file {path_text} size")
+        _require_nonnegative_int(entry["size"], f"artifact manifest file {path_text} size")
         _require_sha256(entry["sha256"], f"artifact manifest file {path_text} sha256")
         recorded[path_text] = entry
     actual_files = _walk_regular_files(root, {manifest_path})
@@ -1227,24 +1608,33 @@ def validate_service_artifact(
         raise EvidenceError(f"service artifact {differing.replace('_', ' ')} mismatch")
 
 
-def _validate_limits(value: object, context: str, depth: int = 0) -> None:
+def _validate_limits(
+    value: object, context: str, depth: int = 0, *, nodeid_values: bool = False
+) -> None:
     if depth > MAX_NESTING_DEPTH:
         raise EvidenceError(f"{context} exceeds the maximum nesting depth")
     if isinstance(value, str):
-        if len(value.encode("utf-8")) > MAX_STRING_BYTES:
-            raise EvidenceError(f"{context} string exceeds {MAX_STRING_BYTES} bytes")
+        limit = MAX_NODEID_BYTES if nodeid_values else MAX_STRING_BYTES
+        if len(value.encode("utf-8")) > limit:
+            raise EvidenceError(f"{context} string exceeds {limit} bytes")
     elif isinstance(value, list):
-        if len(value) > MAX_COLLECTION_NODEIDS:
-            raise EvidenceError(f"{context} array exceeds {MAX_COLLECTION_NODEIDS} entries")
+        limit = MAX_COLLECTION_NODEIDS if nodeid_values else MAX_GENERIC_ARRAY
+        if len(value) > limit:
+            raise EvidenceError(f"{context} array exceeds {limit} entries")
         for index, item in enumerate(value):
-            _validate_limits(item, f"{context}[{index}]", depth + 1)
+            _validate_limits(item, f"{context}[{index}]", depth + 1, nodeid_values=nodeid_values)
     elif isinstance(value, dict):
         if len(value) > 64:
             raise EvidenceError(f"{context} object contains too many keys")
         for key, item in value.items():
             if not isinstance(key, str):
                 raise EvidenceError(f"{context} contains a non-string key")
-            _validate_limits(item, f"{context}.{key}", depth + 1)
+            _validate_limits(
+                item,
+                f"{context}.{key}",
+                depth + 1,
+                nodeid_values=context == "collection" and key == "nodeids",
+            )
     elif value is not None and not isinstance(value, (bool, int, float)):
         raise EvidenceError(f"{context} contains an unsupported JSON value")
 
@@ -1275,6 +1665,11 @@ def _validate_repository_identity(value: object, context: str) -> None:
 
 
 def _validate_resolved(value: dict[str, object]) -> None:
+    disposition = value.get("disposition")
+    if disposition in {"ignore", "reject"}:
+        _expect_exact_keys(value, {"disposition", "reason"}, "resolved")
+        _require_string(value["reason"], "resolved reason")
+        return
     keys = {
         "schema_version",
         "disposition",
@@ -1290,7 +1685,7 @@ def _validate_resolved(value: dict[str, object]) -> None:
     _expect_exact_keys(value, keys, "resolved")
     if value["schema_version"] != 1:
         raise EvidenceError("resolved schema_version must be 1")
-    if value["disposition"] not in {"run", "reject", "ignore"}:
+    if value["disposition"] != "run":
         raise EvidenceError("resolved disposition is invalid")
     _require_optional_string(value["reason"], "resolved reason")
     for key in ("run_id", "run_attempt", "trigger_comment_id"):
@@ -1478,6 +1873,7 @@ def materialize_wheelhouse(
     lock = load_runtime_lock(lock_path)
     _empty_directory(wheelhouse, "wheelhouse")
     packages = []
+    audits: list[WheelAudit] = []
     for package in sorted(lock["packages"], key=lambda item: normalize_name(str(item["name"]))):
         destination = wheelhouse / str(package["filename"])
         final_url = downloader(str(package["url"]), destination)
@@ -1489,6 +1885,8 @@ def materialize_wheelhouse(
                 f"wheel version mismatch for {package['name']}: {audit.version} != {package['version']}"
             )
         packages.append(dict(package))
+        audits.append(audit)
+    _validate_wheel_audit_set(audits)
     write_json_atomic(
         wheelhouse / "wheelhouse-manifest.json",
         {
@@ -1549,12 +1947,15 @@ def verify_wheelhouse(lock_path: Path, wheelhouse: Path) -> None:
             raise EvidenceError(f"wheelhouse contains a symlink: {path}")
         if path.stat().st_mode & 0o222:
             raise EvidenceError(f"wheelhouse path is writable: {path}")
+    audits: list[WheelAudit] = []
     for package in expected_packages:
         path = wheelhouse / str(package["filename"])
         verify_sha256(path, str(package["sha256"]), int(package["size"]))
         audit = audit_wheel(path, str(package["name"]))
         if audit.version != package["version"]:
             raise EvidenceError(f"wheelhouse wheel version mismatch for {package['name']}")
+        audits.append(audit)
+    _validate_wheel_audit_set(audits)
 
 
 def emit_requirements(lock_path: Path, output: Path) -> None:
@@ -1569,6 +1970,630 @@ def emit_requirements(lock_path: Path, output: Path) -> None:
     temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
     temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
     os.replace(temporary, output)
+
+
+def _checked_directory(path: Path, context: str) -> Path:
+    _assert_no_symlink_components(path)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as error:
+        raise EvidenceError(f"required {context} is missing: {path}") from error
+    except OSError as error:
+        raise EvidenceError(f"cannot inspect {context} {path}: {error}") from error
+    if not stat.S_ISDIR(mode):
+        raise EvidenceError(f"required {context} must be a directory: {path}")
+    return path.resolve()
+
+
+def _checked_regular_file(path: Path, context: str, *, allow_symlink: bool = False) -> Path:
+    if allow_symlink:
+        _assert_no_symlink_components(path.parent)
+    else:
+        _assert_no_symlink_components(path)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as error:
+        raise EvidenceError(f"required {context} is missing: {path}") from error
+    except OSError as error:
+        raise EvidenceError(f"cannot inspect {context} {path}: {error}") from error
+    if stat.S_ISLNK(mode):
+        if not allow_symlink:
+            raise EvidenceError(f"{context} must not be a symlink: {path}")
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as error:
+            raise EvidenceError(f"cannot resolve {context} {path}: {error}") from error
+        if not resolved.is_file():
+            raise EvidenceError(f"{context} must resolve to a regular file: {path}")
+        return resolved
+    if not stat.S_ISREG(mode):
+        raise EvidenceError(f"required {context} must be a regular file: {path}")
+    return path.resolve()
+
+
+def bound_regular_log(path: Path, limit: int) -> None:
+    if not _is_int(limit) or limit <= 0 or limit > 64 * 1024 * 1024:
+        raise EvidenceError("log size limit must be between 1 byte and 64 MiB")
+    _assert_no_symlink_components(path.parent)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise EvidenceError(f"cannot open bounded log {path}: {error}") from error
+    temporary: Path | None = None
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise EvidenceError(f"bounded log must be a regular file: {path}")
+        if metadata.st_size <= limit:
+            return
+        os.lseek(descriptor, metadata.st_size - limit, os.SEEK_SET)
+        payload = bytearray()
+        while len(payload) < limit:
+            chunk = os.read(descriptor, limit - len(payload))
+            if not chunk:
+                break
+            payload.extend(chunk)
+        temporary_descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}.", dir=path.parent
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(temporary_descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        temporary = None
+    except OSError as error:
+        raise EvidenceError(f"cannot bound log {path}: {error}") from error
+    finally:
+        os.close(descriptor)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _path_within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve(strict=True).relative_to(root.resolve(strict=True))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def prepare_pair_root(root: Path, system_path: str) -> None:
+    if not root.is_absolute():
+        raise EvidenceError("pair root must be an absolute path")
+    make_pair_environment(root, {"PATH": system_path})
+    for relative in ("artifact", "build", "wheels"):
+        path = root / relative
+        path.mkdir()
+        os.chmod(path, 0o700)
+    os.chmod(root, 0o700)
+    for relative in set(_PAIR_PATH_NAMES.values()):
+        os.chmod(root / relative, 0o700)
+
+
+_PAIR_WHEEL_DISTRIBUTIONS = {
+    "companion": "apache-tvm-ffi",
+    "tilelang": "tilelang",
+    "tileops": "tileops",
+}
+
+
+def _pair_wheel_record(audit: WheelAudit, source_sha: str) -> dict[str, object]:
+    return {
+        "distribution": audit.name,
+        "version": audit.version,
+        "filename": audit.filename,
+        "sha256": audit.sha256,
+        "size": audit.size,
+        "source_sha": source_sha,
+    }
+
+
+def _validate_pair_wheel_record(
+    value: object, context: str, expected_distribution: str
+) -> dict[str, object]:
+    record = _expect_dict(value, context)
+    _expect_exact_keys(
+        record,
+        {"distribution", "version", "filename", "sha256", "size", "source_sha"},
+        context,
+    )
+    distribution = _require_string(record["distribution"], f"{context} distribution")
+    if normalize_name(distribution) != expected_distribution:
+        raise EvidenceError(f"{context} distribution mismatch")
+    _require_string(record["version"], f"{context} version")
+    filename = _safe_relative_path(record["filename"], f"{context} filename")
+    if len(filename.parts) != 1 or not filename.name.endswith(".whl"):
+        raise EvidenceError(f"{context} filename must name one wheel")
+    _require_sha256(record["sha256"], f"{context} sha256")
+    _require_positive_int(record["size"], f"{context} size")
+    _require_git_sha(record["source_sha"], f"{context} source_sha")
+    return record
+
+
+def _load_pair_wheel_manifest(path: Path) -> dict[str, object]:
+    value = _expect_dict(_read_json(path), "pair wheel manifest")
+    _expect_exact_keys(
+        value,
+        {"schema_version", "wheel_dir", "companion", "tilelang", "tileops"},
+        "pair wheel manifest",
+    )
+    if value["schema_version"] != 1:
+        raise EvidenceError("pair wheel manifest schema_version must be 1")
+    wheel_dir_text = _require_string(value["wheel_dir"], "pair wheel manifest wheel_dir")
+    wheel_dir = Path(wheel_dir_text)
+    if not wheel_dir.is_absolute():
+        raise EvidenceError("pair wheel manifest wheel_dir must be absolute")
+    wheel_dir = _checked_directory(wheel_dir, "pair wheel directory")
+    if str(wheel_dir) != wheel_dir_text:
+        raise EvidenceError("pair wheel manifest wheel_dir is not canonical")
+
+    audits: list[WheelAudit] = []
+    expected_files: set[str] = set()
+    for key, distribution in _PAIR_WHEEL_DISTRIBUTIONS.items():
+        record = _validate_pair_wheel_record(value[key], f"pair wheel manifest {key}", distribution)
+        wheel_path = wheel_dir / str(record["filename"])
+        audit = audit_wheel(wheel_path, distribution)
+        actual = _pair_wheel_record(audit, str(record["source_sha"]))
+        if actual != record:
+            raise EvidenceError(f"pair wheel manifest {key} no longer matches {wheel_path}")
+        audits.append(audit)
+        expected_files.add(wheel_path.name)
+    actual_files: set[str] = set()
+    for entry in wheel_dir.iterdir():
+        if entry.is_symlink() or not entry.is_file() or not entry.name.endswith(".whl"):
+            raise EvidenceError(f"pair wheel directory contains an unexpected entry: {entry}")
+        actual_files.add(entry.name)
+    if actual_files != expected_files:
+        raise EvidenceError("pair wheel directory file set differs from its manifest")
+    _validate_wheel_audit_set(audits)
+    return value
+
+
+def audit_pair_wheels(
+    wheel_dir: Path,
+    *,
+    tileops_sha: str,
+    tilelang_sha: str,
+    output: Path,
+) -> dict[str, object]:
+    tileops_sha = _require_git_sha(tileops_sha, "TileOps source SHA")
+    tilelang_sha = _require_git_sha(tilelang_sha, "TileLang source SHA")
+    wheel_dir = _checked_directory(wheel_dir, "pair wheel directory")
+    paths: list[Path] = []
+    for entry in sorted(wheel_dir.iterdir(), key=lambda item: item.name):
+        if entry.is_symlink() or not entry.is_file() or not entry.name.endswith(".whl"):
+            raise EvidenceError(f"pair wheel directory contains an unexpected entry: {entry}")
+        paths.append(entry)
+    selected = {
+        key: select_wheel(paths, distribution)
+        for key, distribution in _PAIR_WHEEL_DISTRIBUTIONS.items()
+    }
+    selected_files = {audit.filename for audit in selected.values()}
+    if selected_files != {path.name for path in paths}:
+        raise EvidenceError("pair wheel directory contains unexpected or ambiguous wheels")
+    _validate_wheel_audit_set(list(selected.values()))
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "wheel_dir": str(wheel_dir),
+        "companion": _pair_wheel_record(selected["companion"], tilelang_sha),
+        "tilelang": _pair_wheel_record(selected["tilelang"], tilelang_sha),
+        "tileops": _pair_wheel_record(selected["tileops"], tileops_sha),
+    }
+    _assert_no_symlink_components(output.parent)
+    write_json_atomic(output, value)
+    return _load_pair_wheel_manifest(output)
+
+
+def pair_wheel_path(manifest: Path, distribution: str) -> Path:
+    if distribution not in _PAIR_WHEEL_DISTRIBUTIONS:
+        raise EvidenceError("pair wheel distribution must be companion, tilelang, or tileops")
+    value = _load_pair_wheel_manifest(manifest)
+    return Path(str(value["wheel_dir"])) / str(value[distribution]["filename"])
+
+
+def _validate_installed_pair(value: object) -> dict[str, object]:
+    document = _expect_dict(value, "installed pair")
+    _expect_exact_keys(
+        document,
+        {"schema_version", "python", "companion", "tilelang", "tileops"},
+        "installed pair",
+    )
+    if document["schema_version"] != 1:
+        raise EvidenceError("installed pair schema_version must be 1")
+    python = _expect_dict(document["python"], "installed pair python")
+    _expect_exact_keys(python, {"version", "executable", "prefix"}, "installed pair python")
+    version = _require_string(python["version"], "installed pair python version")
+    if not re.fullmatch(r"3\.10\.\d+", version):
+        raise EvidenceError("installed pair Python version must be 3.10.x")
+    for key in ("executable", "prefix"):
+        path = Path(_require_string(python[key], f"installed pair python {key}"))
+        if not path.is_absolute():
+            raise EvidenceError(f"installed pair python {key} must be absolute")
+
+    for key, expected_distribution in _PAIR_WHEEL_DISTRIBUTIONS.items():
+        record = _expect_dict(document[key], f"installed pair {key}")
+        _expect_exact_keys(
+            record,
+            {"distribution", "version", "import_path"},
+            f"installed pair {key}",
+        )
+        distribution = _require_string(record["distribution"], f"installed pair {key} distribution")
+        if normalize_name(distribution) != expected_distribution:
+            raise EvidenceError(f"installed pair {key} distribution mismatch")
+        _require_string(record["version"], f"installed pair {key} version")
+        import_path = Path(
+            _require_string(record["import_path"], f"installed pair {key} import_path")
+        )
+        if not import_path.is_absolute():
+            raise EvidenceError(f"installed pair {key} import_path must be absolute")
+    return document
+
+
+def _load_installed_pair(path: Path) -> dict[str, object]:
+    return _validate_installed_pair(_read_json(path))
+
+
+def audit_installed_pair(
+    pair_root: Path,
+    wheel_manifest: Path,
+    *,
+    tileops_source: Path,
+    tilelang_source: Path,
+    trusted_source: Path,
+    output: Path,
+    prefix: Path | None = None,
+    executable: Path | None = None,
+    python_version: str | None = None,
+    module_loader: Callable[[str], object] = importlib.import_module,
+    distribution_loader: Callable[[str], object] = importlib.metadata.distribution,
+) -> dict[str, object]:
+    pair_root = _checked_directory(pair_root, "pair root")
+    expected_prefix = _checked_directory(pair_root / "venv", "pair virtual environment")
+    prefix = _checked_directory(prefix or Path(sys.prefix), "Python environment prefix")
+    if prefix != expected_prefix:
+        raise EvidenceError("installed packages are not running from the pair virtual environment")
+    _checked_regular_file(prefix / "pyvenv.cfg", "pair virtual environment pyvenv.cfg")
+    executable_path = (executable or Path(sys.executable)).absolute()
+    if executable_path.parent != prefix / "bin":
+        raise EvidenceError("Python executable is not inside the pair virtual environment bin")
+    _checked_regular_file(executable_path, "pair Python executable", allow_symlink=True)
+    version = python_version or platform.python_version()
+    if not re.fullmatch(r"3\.10\.\d+", version):
+        raise EvidenceError("pair Python version must be 3.10.x")
+
+    source_roots = [
+        _checked_directory(tileops_source, "TileOps source"),
+        _checked_directory(tilelang_source, "TileLang source"),
+        _checked_directory(trusted_source, "trusted baseline source"),
+    ]
+    wheels = _load_pair_wheel_manifest(wheel_manifest)
+    module_names = {"companion": "tvm_ffi", "tilelang": "tilelang", "tileops": "tileops"}
+    records: dict[str, dict[str, object]] = {}
+    for key, distribution_name in _PAIR_WHEEL_DISTRIBUTIONS.items():
+        try:
+            distribution = distribution_loader(distribution_name)
+            module = module_loader(module_names[key])
+        except Exception as error:
+            raise EvidenceError(f"cannot import installed {distribution_name}: {error}") from error
+        installed_version = getattr(distribution, "version", None)
+        if installed_version != wheels[key]["version"]:
+            raise EvidenceError(f"installed {distribution_name} version does not match its wheel")
+        locate_file = getattr(distribution, "locate_file", None)
+        if not callable(locate_file):
+            raise EvidenceError(f"installed {distribution_name} metadata has no locate_file()")
+        distribution_root = Path(locate_file("")).resolve(strict=True)
+        if not _path_within(distribution_root, prefix):
+            raise EvidenceError(
+                f"installed {distribution_name} metadata is outside the pair environment"
+            )
+        origin_value = getattr(module, "__file__", None)
+        if not isinstance(origin_value, str) or not origin_value:
+            raise EvidenceError(f"installed {distribution_name} is not file-backed")
+        origin = _checked_regular_file(Path(origin_value), f"installed {distribution_name} import")
+        if not _path_within(origin, prefix):
+            raise EvidenceError(
+                f"installed {distribution_name} import is outside the pair environment"
+            )
+        if any(_path_within(origin, source_root) for source_root in source_roots):
+            raise EvidenceError(
+                f"installed {distribution_name} import resolved from a source checkout"
+            )
+        records[key] = {
+            "distribution": distribution_name,
+            "version": installed_version,
+            "import_path": str(origin),
+        }
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "python": {
+            "version": version,
+            "executable": str(executable_path),
+            "prefix": str(prefix),
+        },
+        **records,
+    }
+    _validate_installed_pair(value)
+    write_json_atomic(output, value)
+    return value
+
+
+def _load_payload_summary(path: Path) -> dict[str, object]:
+    value = _expect_dict(_read_json(path), "payload summary")
+    _expect_exact_keys(
+        value,
+        {"schema_version", "payload_sha256", "manifest_sha256", "harness_sha256"},
+        "payload summary",
+    )
+    if value["schema_version"] != 1:
+        raise EvidenceError("payload summary schema_version must be 1")
+    for key in ("payload_sha256", "manifest_sha256", "harness_sha256"):
+        _require_sha256(value[key], f"payload summary {key}")
+    return value
+
+
+def write_pair_provenance(
+    *,
+    pair: str,
+    run_id: int,
+    run_attempt: int,
+    python: Path,
+    python_include: Path,
+    runtime_lock: Path,
+    wheelhouse: Path,
+    wheel_manifest: Path,
+    installed: Path,
+    payload_manifest: Path,
+    output: Path,
+) -> dict[str, object]:
+    if pair not in {"baseline", "candidate"}:
+        raise EvidenceError("pair must be baseline or candidate")
+    run_id = _require_positive_int(run_id, "run ID")
+    run_attempt = _require_positive_int(run_attempt, "run attempt")
+    verify_wheelhouse(runtime_lock, wheelhouse)
+    wheels = _load_pair_wheel_manifest(wheel_manifest)
+    installed_value = _load_installed_pair(installed)
+    payload = _load_payload_summary(payload_manifest)
+    python_path = python.absolute()
+    if str(python_path) != installed_value["python"]["executable"]:
+        raise EvidenceError("provenance Python executable differs from the installed-pair audit")
+    resolved_python = _checked_regular_file(
+        python_path, "provenance Python executable", allow_symlink=True
+    )
+    include = _checked_directory(python_include, "Python include directory")
+    _checked_regular_file(include / "Python.h", "Python.h")
+
+    provenance_wheels: dict[str, dict[str, object]] = {}
+    for key in _PAIR_WHEEL_DISTRIBUTIONS:
+        if (
+            installed_value[key]["distribution"] != wheels[key]["distribution"]
+            or installed_value[key]["version"] != wheels[key]["version"]
+        ):
+            raise EvidenceError(f"installed {key} identity differs from the audited wheel")
+        provenance_wheels[key] = {
+            "distribution": wheels[key]["distribution"],
+            "version": wheels[key]["version"],
+            "filename": wheels[key]["filename"],
+            "sha256": wheels[key]["sha256"],
+            "source_sha": wheels[key]["source_sha"],
+            "import_path": installed_value[key]["import_path"],
+        }
+    value: dict[str, object] = {
+        "schema_version": 1,
+        "pair": pair,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "python": {
+            "version": installed_value["python"]["version"],
+            "executable": str(python_path),
+            "executable_sha256": sha256_file(resolved_python),
+            "include": str(include),
+        },
+        "runtime_lock_sha256": sha256_file(runtime_lock),
+        "wheelhouse_manifest_sha256": sha256_file(wheelhouse / "wheelhouse-manifest.json"),
+        "payload_sha256": payload["payload_sha256"],
+        "manifest_sha256": payload["manifest_sha256"],
+        "harness_sha256": payload["harness_sha256"],
+        **provenance_wheels,
+    }
+    _validate_provenance(value)
+    write_json_atomic(output, value)
+    return value
+
+
+_PAIR_ARTIFACT_FILES = {
+    "status.json",
+    "provenance.json",
+    "collection.json",
+    "bench_results.xml",
+    "pytest.log",
+    "profile_run.log",
+    "build.log",
+}
+
+
+def _validate_resolved_pair_identity(
+    resolved: Mapping[str, object],
+    *,
+    repository: str,
+    pair: str,
+    run_id: int,
+    run_attempt: int,
+    tileops_sha: str,
+    tilelang_sha: str,
+) -> None:
+    if resolved["tileops"]["repository"] != repository:
+        raise EvidenceError("pair repository differs from resolved.json")
+    if resolved["run_id"] != run_id or resolved["run_attempt"] != run_attempt:
+        raise EvidenceError("pair run identity differs from resolved.json")
+    sha_key = "default_sha" if pair == "baseline" else "merge_sha"
+    if resolved["tileops"][sha_key] != tileops_sha:
+        raise EvidenceError("pair TileOps SHA differs from resolved.json")
+    if resolved["tilelang"][sha_key] != tilelang_sha:
+        raise EvidenceError("pair TileLang SHA differs from resolved.json")
+
+
+def _validate_success_artifact(
+    artifact_root: Path,
+    *,
+    pair: str,
+    run_id: int,
+    run_attempt: int,
+    tileops_sha: str,
+    tilelang_sha: str,
+    payload: Mapping[str, object],
+    resolved: Mapping[str, object],
+) -> None:
+    missing = sorted(
+        (_PAIR_ARTIFACT_FILES - {"status.json"})
+        - {path.name for path in artifact_root.iterdir() if path.is_file()}
+    )
+    if missing:
+        raise EvidenceError(
+            f"successful pair artifact is missing required files: {', '.join(missing)}"
+        )
+    provenance = load_bounded_json(artifact_root / "provenance.json", "provenance")
+    collection = load_bounded_json(artifact_root / "collection.json", "collection")
+    for document_name, document in (("provenance", provenance), ("collection", collection)):
+        if (
+            document["pair"] != pair
+            or document["run_id"] != run_id
+            or document["run_attempt"] != run_attempt
+        ):
+            raise EvidenceError(f"{document_name} identity differs from the pair")
+        for key in ("payload_sha256", "manifest_sha256", "harness_sha256"):
+            if document[key] != payload[key]:
+                raise EvidenceError(f"{document_name} {key} differs from the payload")
+    if provenance["harness_sha256"] != resolved["harness_sha256"]:
+        raise EvidenceError("provenance harness SHA differs from resolved.json")
+    if provenance["tileops"]["source_sha"] != tileops_sha:
+        raise EvidenceError("provenance TileOps SHA differs from the pair")
+    for key in ("companion", "tilelang"):
+        if provenance[key]["source_sha"] != tilelang_sha:
+            raise EvidenceError(f"provenance {key} SHA differs from the pair")
+
+
+def finalize_pair(
+    *,
+    artifact_root: Path,
+    resolved: Path,
+    repository: str,
+    pair: str,
+    state: str,
+    phase: str,
+    exit_code: int,
+    reason: str,
+    started_at: str,
+    finished_at: str,
+    run_id: int,
+    run_attempt: int,
+    tileops_sha: str,
+    tilelang_sha: str,
+    payload_manifest: Path,
+) -> None:
+    if pair not in {"baseline", "candidate"}:
+        raise EvidenceError("pair must be baseline or candidate")
+    if state not in {"success", "failed", "skipped"}:
+        raise EvidenceError("pair state is invalid")
+    run_id = _require_positive_int(run_id, "run ID")
+    run_attempt = _require_positive_int(run_attempt, "run attempt")
+    tileops_sha = _require_git_sha(tileops_sha, "TileOps SHA")
+    tilelang_sha = _require_git_sha(tilelang_sha, "TileLang SHA")
+    resolved_value = load_bounded_json(resolved, "resolved")
+    _validate_resolved_pair_identity(
+        resolved_value,
+        repository=repository,
+        pair=pair,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        tileops_sha=tileops_sha,
+        tilelang_sha=tilelang_sha,
+    )
+    _assert_no_symlink_components(artifact_root)
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    artifact_root = _checked_directory(artifact_root, "pair artifact root")
+    manifest_path = artifact_root / "artifact-manifest.json"
+    if manifest_path.is_symlink():
+        raise EvidenceError("artifact manifest must not be a symlink")
+    manifest_path.unlink(missing_ok=True)
+
+    payload: dict[str, object] | None = None
+    payload_error: EvidenceError | None = None
+    try:
+        payload = _load_payload_summary(payload_manifest)
+    except EvidenceError as error:
+        payload_error = error
+    payload_sha256 = str(payload["payload_sha256"]) if payload is not None else "0" * 64
+
+    evidence_error: EvidenceError | None = None
+    try:
+        entries = list(artifact_root.iterdir())
+        for entry in entries:
+            if entry.name == "artifact-manifest.json":
+                continue
+            if entry.is_symlink() or not entry.is_file():
+                raise EvidenceError(f"pair artifact contains a non-regular entry: {entry.name}")
+            if entry.name not in _PAIR_ARTIFACT_FILES:
+                raise EvidenceError(f"pair artifact contains an unexpected file: {entry.name}")
+        if state == "success":
+            if phase != "complete" or exit_code != 0 or reason:
+                raise EvidenceError("successful pair status is internally inconsistent")
+            if payload_error is not None or payload is None:
+                raise payload_error or EvidenceError("successful pair has no payload summary")
+            _validate_success_artifact(
+                artifact_root,
+                pair=pair,
+                run_id=run_id,
+                run_attempt=run_attempt,
+                tileops_sha=tileops_sha,
+                tilelang_sha=tilelang_sha,
+                payload=payload,
+                resolved=resolved_value,
+            )
+        elif not reason:
+            raise EvidenceError("failed or skipped pair status requires a reason")
+    except EvidenceError as error:
+        evidence_error = error
+        state = "failed"
+        phase = "artifact"
+        exit_code = exit_code or 2
+        reason = f"artifact_failed: {error}"[:MAX_STRING_BYTES]
+
+    status = {
+        "schema_version": 1,
+        "pair": pair,
+        "state": state,
+        "phase": phase,
+        "exit_code": exit_code,
+        "reason": reason,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
+        "tileops_sha": tileops_sha,
+        "tilelang_sha": tilelang_sha,
+        "payload_sha256": payload_sha256,
+    }
+    _validate_status(status)
+    write_json_atomic(artifact_root / "status.json", status)
+    write_artifact_manifest(
+        artifact_root,
+        manifest_path,
+        {"repository": repository, "run_id": run_id, "run_attempt": run_attempt, "pair": pair},
+    )
+    if evidence_error is not None:
+        raise evidence_error
 
 
 def _toolchain_json(toolchain: Toolchain) -> dict[str, str]:
@@ -1613,6 +2638,70 @@ def _build_parser() -> argparse.ArgumentParser:
     requirements.add_argument("--lock", type=Path, required=True)
     requirements.add_argument("--output", type=Path, required=True)
 
+    maca = subparsers.add_parser("resolve-maca-environment")
+    maca.add_argument("--maca-path", type=Path, required=True)
+    maca.add_argument("--driver-library", type=Path, default=Path("/opt/mxdriver/lib"))
+    maca.add_argument("--system-path", default=DEFAULT_SYSTEM_PATH)
+    maca.add_argument("--output", type=Path, required=True)
+
+    bound_log = subparsers.add_parser("bound-log")
+    bound_log.add_argument("--path", type=Path, required=True)
+    bound_log.add_argument("--limit", type=int, required=True)
+
+    prepare = subparsers.add_parser("prepare-pair-root")
+    prepare.add_argument("--root", type=Path, required=True)
+    prepare.add_argument("--system-path", required=True)
+
+    audit_wheels = subparsers.add_parser("audit-pair-wheels")
+    audit_wheels.add_argument("--wheel-dir", type=Path, required=True)
+    audit_wheels.add_argument("--tileops-sha", required=True)
+    audit_wheels.add_argument("--tilelang-sha", required=True)
+    audit_wheels.add_argument("--output", type=Path, required=True)
+
+    wheel_path = subparsers.add_parser("pair-wheel-path")
+    wheel_path.add_argument("--manifest", type=Path, required=True)
+    wheel_path.add_argument(
+        "--distribution", choices=tuple(_PAIR_WHEEL_DISTRIBUTIONS), required=True
+    )
+
+    audit_installed = subparsers.add_parser("audit-installed-pair")
+    audit_installed.add_argument("--pair-root", type=Path, required=True)
+    audit_installed.add_argument("--wheel-manifest", type=Path, required=True)
+    audit_installed.add_argument("--tileops-source", type=Path, required=True)
+    audit_installed.add_argument("--tilelang-source", type=Path, required=True)
+    audit_installed.add_argument("--trusted-source", type=Path, required=True)
+    audit_installed.add_argument("--output", type=Path, required=True)
+
+    provenance = subparsers.add_parser("write-pair-provenance")
+    provenance.add_argument("--pair", choices=("baseline", "candidate"), required=True)
+    provenance.add_argument("--run-id", type=int, required=True)
+    provenance.add_argument("--run-attempt", type=int, required=True)
+    provenance.add_argument("--python", type=Path, required=True)
+    provenance.add_argument("--python-include", type=Path, required=True)
+    provenance.add_argument("--runtime-lock", type=Path, required=True)
+    provenance.add_argument("--wheelhouse", type=Path, required=True)
+    provenance.add_argument("--wheel-manifest", type=Path, required=True)
+    provenance.add_argument("--installed", type=Path, required=True)
+    provenance.add_argument("--payload-manifest", type=Path, required=True)
+    provenance.add_argument("--output", type=Path, required=True)
+
+    finalize = subparsers.add_parser("finalize-pair")
+    finalize.add_argument("--artifact-root", type=Path, required=True)
+    finalize.add_argument("--resolved", type=Path, required=True)
+    finalize.add_argument("--repository", required=True)
+    finalize.add_argument("--pair", choices=("baseline", "candidate"), required=True)
+    finalize.add_argument("--state", choices=("success", "failed", "skipped"), required=True)
+    finalize.add_argument("--phase", required=True)
+    finalize.add_argument("--exit-code", type=int, required=True)
+    finalize.add_argument("--reason", required=True)
+    finalize.add_argument("--started-at", required=True)
+    finalize.add_argument("--finished-at", required=True)
+    finalize.add_argument("--run-id", type=int, required=True)
+    finalize.add_argument("--run-attempt", type=int, required=True)
+    finalize.add_argument("--tileops-sha", required=True)
+    finalize.add_argument("--tilelang-sha", required=True)
+    finalize.add_argument("--payload-manifest", type=Path, required=True)
+
     return parser
 
 
@@ -1637,6 +2726,69 @@ def main(argv: Sequence[str] | None = None) -> int:
             verify_wheelhouse(arguments.lock, arguments.wheelhouse)
         elif arguments.command == "emit-requirements":
             emit_requirements(arguments.lock, arguments.output)
+        elif arguments.command == "resolve-maca-environment":
+            write_json_atomic(
+                arguments.output,
+                resolve_maca_environment(
+                    arguments.maca_path,
+                    driver_library=arguments.driver_library,
+                    system_path=arguments.system_path,
+                ),
+            )
+        elif arguments.command == "bound-log":
+            bound_regular_log(arguments.path, arguments.limit)
+        elif arguments.command == "prepare-pair-root":
+            prepare_pair_root(arguments.root, arguments.system_path)
+        elif arguments.command == "audit-pair-wheels":
+            audit_pair_wheels(
+                arguments.wheel_dir,
+                tileops_sha=arguments.tileops_sha,
+                tilelang_sha=arguments.tilelang_sha,
+                output=arguments.output,
+            )
+        elif arguments.command == "pair-wheel-path":
+            print(pair_wheel_path(arguments.manifest, arguments.distribution))
+        elif arguments.command == "audit-installed-pair":
+            audit_installed_pair(
+                arguments.pair_root,
+                arguments.wheel_manifest,
+                tileops_source=arguments.tileops_source,
+                tilelang_source=arguments.tilelang_source,
+                trusted_source=arguments.trusted_source,
+                output=arguments.output,
+            )
+        elif arguments.command == "write-pair-provenance":
+            write_pair_provenance(
+                pair=arguments.pair,
+                run_id=arguments.run_id,
+                run_attempt=arguments.run_attempt,
+                python=arguments.python,
+                python_include=arguments.python_include,
+                runtime_lock=arguments.runtime_lock,
+                wheelhouse=arguments.wheelhouse,
+                wheel_manifest=arguments.wheel_manifest,
+                installed=arguments.installed,
+                payload_manifest=arguments.payload_manifest,
+                output=arguments.output,
+            )
+        elif arguments.command == "finalize-pair":
+            finalize_pair(
+                artifact_root=arguments.artifact_root,
+                resolved=arguments.resolved,
+                repository=arguments.repository,
+                pair=arguments.pair,
+                state=arguments.state,
+                phase=arguments.phase,
+                exit_code=arguments.exit_code,
+                reason=arguments.reason,
+                started_at=arguments.started_at,
+                finished_at=arguments.finished_at,
+                run_id=arguments.run_id,
+                run_attempt=arguments.run_attempt,
+                tileops_sha=arguments.tileops_sha,
+                tilelang_sha=arguments.tilelang_sha,
+                payload_manifest=arguments.payload_manifest,
+            )
         else:
             parser.error(f"unknown command: {arguments.command}")
     except EvidenceError as error:
