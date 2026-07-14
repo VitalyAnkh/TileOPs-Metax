@@ -70,13 +70,15 @@ have `write`, `maintain`, or `admin` permission in the TileOps repository.
 Unrelated comments and commands from unauthorized users are ignored without
 starting GPU work.
 
-Workflow concurrency is scoped to the TileOps pull-request number:
+Benchmark-job concurrency is scoped to the TileOps pull-request number:
 
 ```text
 cross-repo-perf-<tileops-pr-number>
 ```
 
-A newer invocation for the same pull request cancels an older invocation.
+Resolution happens before a job enters this group, so unrelated or unauthorized
+comments cannot cancel active GPU work. A newer authorized invocation for the
+same pull request cancels an older benchmark.
 
 ## Source Resolution
 
@@ -152,10 +154,18 @@ Responsibilities:
 but allows the report job to post a concise validation error for an authorized
 request. `run` starts the benchmark job.
 
+`resolved.json` uses a disposition-specific schema: `ignore` and `reject`
+contain exactly `disposition` and non-empty `reason`; `run` contains the full
+immutable repository identities, trigger metadata, and trusted harness digest.
+
 The benchmark job declares `needs: resolve` and runs only when
 `needs.resolve.outputs.disposition == 'run'`. Expected validation errors are
 captured as `reject` outputs instead of failing the resolver process, so the
 report job can explain them.
+
+Every external Action is pinned to a reviewed full commit SHA. Floating major
+tags are not executed on either the self-hosted benchmark runner or the hosted
+report job with comment permission.
 
 The resolver has read-only repository, issue, and pull-request access. It never
 checks out or executes candidate code.
@@ -225,6 +235,8 @@ Python executable, standard library, include directory, and `Python.h`; it must
 not use the runner's default interpreter. Before continuing, it compiles,
 imports, and deletes a minimal C extension against that interpreter to prove the
 headers, compiler, linker, and extension suffix form a working build toolchain.
+The extension probe uses a fixed system-tool path and a minimal allowlisted
+environment; inherited compiler and dynamic-loader controls are not honored.
 Archive extraction rejects traversal, absolute or escaping links, hard links,
 and device entries. It permits only relative symbolic links whose normalized
 targets remain inside the extraction root, because the pinned managed Python
@@ -242,9 +254,12 @@ builds validated for this runner generation. The trusted preparation step:
    Python tag, and platform tag;
 3. rejects sdists or an artifact that is not compatible with CPython 3.10 on the
    runner platform;
-4. creates each pair environment with uv and installs only from that wheelhouse
+4. rejects ZIP special entries, excessive expansion/compression ratios,
+   cross-wheel install-path collisions, and ambiguous ownership of the two
+   explicitly approved startup-hook modules;
+5. creates each pair environment with uv and installs only from that wheelhouse
    using `--no-index` and hash checking;
-5. runs dependency consistency checks and imports the required MACA runtime,
+6. runs dependency consistency checks and imports the required MACA runtime,
    benchmark libraries, pytest, and build tooling before source builds begin.
 
 Both pairs consume the same immutable run-local wheelhouse manifest. TileLang,
@@ -279,11 +294,19 @@ or benchmark subprocess, the trusted runner sets pair-local values for at least:
   `PYTHONPYCACHEPREFIX`;
 - any MACA/compiler-specific cache variable detected in the runner environment.
 
-The helper clears inherited values first, recreates every directory empty with
-non-shared permissions, resolves it with `realpath`, and rejects a symlink or a
-path outside the current pair root. `PYTHONPATH` and user-site loading remain
-disabled. The shared runtime wheelhouse is a separate read-only input after its
-manifest is finalized; it is never used as a writable cache.
+The helper constructs the subprocess environment from an allowlist, validates a
+system-only `PATH`, and does not inherit Python, pip, uv, compiler,
+dynamic-loader, token, or agent controls. It recreates every writable directory
+empty with non-shared permissions, resolves it with `realpath`, and rejects a
+symlink or a path outside the current pair root. `PYTHONPATH` and user-site
+loading remain disabled. The shared runtime wheelhouse is a separate read-only
+input after its manifest is finalized; it is never used as a writable cache.
+
+Trusted preparation resolves the canonical MACA installation, compiler binary
+directories, runtime/driver library directories, and the GCC major passed to
+mxcc. Both builds and both benchmark runs receive the same fixed `MACA_PATH`,
+`LD_LIBRARY_PATH`, system `PATH`, and `TILELANG_MXCC_FLAGS`; inherited platform
+paths are discarded.
 
 Each pair is prepared as follows:
 
@@ -312,8 +335,9 @@ for a pair. Zero or ambiguous matches are provenance failures.
 
 ## Trusted Benchmark Payload
 
-Both runs execute an identical payload taken from the resolved TileOps baseline
-SHA. It contains `benchmarks/`, baseline `workloads/`, the baseline `tests/`
+Both runs execute one identical payload constructed before candidate checkout
+from the resolved TileOps baseline SHA. It contains `benchmarks/`, baseline
+`workloads/`, the baseline `tests/`
 helpers imported by benchmark modules, the baseline `tileops/manifest/*.yaml`
 snapshot, the trusted pytest configuration, and a trusted pytest plugin used by
 this workflow. The payload is copied to a neutral directory that does not
@@ -347,11 +371,12 @@ module is copied as `cross_repo_perf_harness.py` and hash-checked immediately
 before Python starts. `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` disables candidate or
 environment-provided pytest entry points. The command line explicitly loads the
 harness first and then the one required trusted third-party plugin,
-`pytest_timeout`. Pytest processes command-line plugins before loading
-`benchmarks/conftest.py`, so the manifest override is installed before any
-benchmark module can import `load_workloads`. Pair wheel audits also reject a
-TileOps or TileLang wheel that contains `.pth`, `sitecustomize.py`,
-`usercustomize.py`, or a `pytest11` entry point.
+`pytest_timeout`. The command-line harness implements
+`pytest_load_initial_conftests` to install the manifest override before pytest
+imports `benchmarks/conftest.py`; `pytest_configure` then verifies the same
+state idempotently. Pair wheel audits also reject a TileOps or TileLang wheel
+that contains `.pth`, `sitecustomize.py`, `usercustomize.py`, or a `pytest11`
+entry point.
 
 ## Benchmark Execution
 
@@ -429,6 +454,8 @@ Missing files remain listed in `status.json`; uploads use
 `if-no-files-found: error` for the required manifest and status files. The
 trusted pair runner generates `artifact-manifest.json` last, listing the
 relative path, byte size, and SHA-256 of every included file except itself.
+It bounds logs through descriptor-based regular-file reads with symlink
+following disabled, so a candidate-created log symlink is an evidence failure.
 
 Each upload step exposes the artifact ID and service-provided digest as a job
 output. The report job receives resolver metadata through trusted job outputs,
@@ -544,6 +571,11 @@ The workflow fails for any of these conditions:
 - duplicate testcase identities make the comparison ambiguous;
 - no common testcase has valid comparable latency data;
 - report generation or comment publication fails.
+
+The reporter records whether complete detailed outputs were rendered separately
+from its exit status. A no-comparable-case result therefore keeps its testcase
+and provenance diagnostics while final adjudication still fails. Generic
+fallback text is generated only when no complete detailed report exists.
 
 The report job still publishes available diagnostics before returning failure.
 

@@ -169,16 +169,20 @@ Test that the runtime module:
 - verifies a file hash without loading the full file into memory;
 - validates all transitive lock entries contain hashes;
 - bootstraps only the locked uv/CPython archives into an empty root, rejecting
-  size/hash mismatch, redirects outside the approved hosts, archive traversal,
+  size/hash mismatch, redirects outside the pinned host/path, archive traversal,
   absolute or escaping links, hardlink/device entries, wrong executable
   versions, missing `Python.h`, failed C-extension compile/import, or any
   fallback to an unqualified/default Python; relative symlinks are accepted
   only when their normalized targets remain inside the extraction root;
 - emits deterministic JSON with sorted keys;
-- replaces every inherited cache/home/temp path, rejects symlink components, and
+- constructs subprocess environments from an allowlist, rejects inherited
+  Python/pip/uv/compiler/dynamic-loader controls and unsafe system `PATH`
+  entries, replaces every cache/home/temp path, rejects symlink components, and
   keeps `HOME`, `TMPDIR`, XDG, uv, pip, ccache, TileLang, Triton, Torch, CUDA,
   Python bytecode, and MACA-specific cache roots under the empty pair root;
 - audits fixture wheels and rejects wrong distributions, duplicate selections,
+  ZIP special files, excessive member/expanded sizes or compression ratios,
+  cross-wheel install-path collisions, startup-module ownership conflicts,
   `.pth`, `sitecustomize.py`, `usercustomize.py`, and `pytest11` entry points;
 - writes and validates deterministic internal artifact manifests, rejecting path
   traversal, symlinks, extra/missing files, size/hash mismatch, and wrong
@@ -188,7 +192,9 @@ Test that the runtime module:
   non-expired state, and repository identity;
 - rejects service digest/ID/name/run-attempt mismatches before any artifact is
   accepted;
-- bounded-loads `resolved.json`, `status.json`, `provenance.json`, and
+- descriptor-loads only bounded regular non-symlink JSON files, translating
+  parser recursion failures, and validates `resolved.json`, `status.json`,
+  `provenance.json`, and
   `collection.json` at a maximum of 2 MiB each, with fixed required keys, type
   checks, length/count limits, enum checks, no duplicate JSON object keys, and
   no unexpected keys.
@@ -206,7 +212,7 @@ def test_verify_sha256_rejects_modified_file(tmp_path):
 
 - [ ] **Step 3: Run focused tests and verify they fail**
 
-Run: `.venv/bin/python -m pytest -q tests/test_cross_repo_perf_runtime.py`
+Run: `.venv/bin/python -m pytest -q --noconftest tests/test_cross_repo_perf_runtime.py`
 
 Expected: FAIL because `scripts/cross_repo_perf_runtime.py` does not exist.
 
@@ -282,11 +288,13 @@ def load_bounded_json(path: Path, schema: str, max_bytes: int = 2 * 1024 * 1024)
 Schema version 1 uses these exact top-level contracts (nested objects also
 reject unknown keys):
 
-- `resolved`: `schema_version`, `disposition`, `reason`, `run_id`,
+- `resolved` with disposition `run`: `schema_version`, `disposition`, `reason`, `run_id`,
   `run_attempt`, `trigger_comment_id`, `trigger_actor`, `harness_sha256`,
   `tileops`, `tilelang`; each repository object contains only `repository`,
   `pr_number`, `pr_url`, `author`, `default_branch`, `default_sha`, `base_ref`,
   `base_sha`, `head_ref`, `head_sha`, and `merge_sha`;
+- `resolved` with disposition `ignore` or `reject`: exactly `disposition` and
+  non-empty `reason`, matching the resolver's expected short outcome;
 - `status`: `schema_version`, `pair`, `state`, `phase`, `exit_code`, `reason`,
   `started_at`, `finished_at`, `run_id`, `run_attempt`, `tileops_sha`,
   `tilelang_sha`, and `payload_sha256`;
@@ -306,8 +314,10 @@ used by the runner. The Actions service record schema contains only
 `schema_version`, `repository`, `run_id`, `run_attempt`, `name`, `artifact_id`,
 `artifact_digest`, and `expired`.
 
-Use `zipfile` plus `email.parser` for wheel metadata. Reject `.pth`,
-`sitecustomize.py`, `usercustomize.py`, and `pytest11` entry points.
+Use `zipfile` plus `email.parser` for wheel metadata. Reject ZIP special files,
+excessive expansion, cross-wheel path collisions, `.pth`, `sitecustomize.py`,
+`usercustomize.py`, and `pytest11` entry points. The exact approved setuptools
+and pytest-timeout hooks must own their imported modules exclusively.
 
 The fixed bootstrap CLI is:
 
@@ -390,7 +400,7 @@ bootstrap root.
 
 - [ ] **Step 8: Run focused tests**
 
-Run: `.venv/bin/python -m pytest -q tests/test_cross_repo_perf_runtime.py`
+Run: `.venv/bin/python -m pytest -q --noconftest tests/test_cross_repo_perf_runtime.py`
 
 Expected: all tests PASS.
 
@@ -449,7 +459,7 @@ different fingerprints.
 
 - [ ] **Step 4: Run tests and verify they fail**
 
-Run: `.venv/bin/python -m pytest -q tests/test_cross_repo_perf_harness.py`
+Run: `.venv/bin/python -m pytest -q --noconftest tests/test_cross_repo_perf_harness.py`
 
 Expected: FAIL because the harness does not exist.
 
@@ -458,6 +468,7 @@ Expected: FAIL because the harness does not exist.
 The module must expose pure helpers plus hooks:
 
 ```python
+def pytest_load_initial_conftests(early_config, parser, args): ...
 def pytest_configure(config): ...
 def pytest_collection_finish(session): ...
 def pytest_sessionfinish(session, exitstatus): ...
@@ -465,7 +476,8 @@ def pytest_sessionfinish(session, exitstatus): ...
 
 Read trusted paths and output paths from required environment variables. Patch
 `tileops.manifest.manifest_files` and clear `load_manifest.cache_clear()` in
-`pytest_configure`, before repository conftest files import benchmark modules.
+`pytest_load_initial_conftests`, before repository conftest files import
+benchmark modules; make `pytest_configure` verify that state idempotently.
 Write `collection.json` atomically with payload, manifest, harness, and node-ID
 digests using the Task 2 bounded schema. Payload construction always reads from
 the immutable TileOps baseline checkout, never from candidate source.
@@ -488,7 +500,7 @@ is never invoked.
 
 - [ ] **Step 7: Run tests**
 
-Run: `.venv/bin/python -m pytest -q tests/test_cross_repo_perf_harness.py`
+Run: `.venv/bin/python -m pytest -q --noconftest tests/test_cross_repo_perf_harness.py`
 
 Expected: all tests PASS.
 
@@ -668,7 +680,8 @@ Parse YAML with a loader that preserves `on` as a string key. Assert:
 
 - only `issue_comment.created` triggers the workflow;
 - exactly `resolve`, `benchmark`, and `report` jobs exist;
-- concurrency is per TileOps PR and cancels older runs;
+- benchmark concurrency is per TileOps PR after a resolved `run`, cancels older
+  benchmarks, and cannot be entered by ignored/rejected comments;
 - resolver/report run on `ubuntu-latest`, benchmark on
   `tileops-metax-runner`;
 - benchmark has no write permissions or secrets and every checkout has
@@ -684,6 +697,7 @@ Parse YAML with a loader that preserves `on` as a string key. Assert:
 - all artifact names contain run ID and run attempt;
 - every upload exports `artifact-id`, `artifact-url`, and `artifact-digest` as
   trusted job outputs;
+- every external Action reference is a reviewed full commit SHA;
 - report grants only `contents: read`, `actions: read`, and `issues: write`,
   queries each artifact ID through the Actions REST API, and verifies exact
   name/run/repository/non-expired/service-digest identity;
@@ -714,7 +728,10 @@ wheelhouse creation and both pair environments. Materialize all runtime wheels
 from the source-locked JSON URLs without any package index access. Run baseline
 pair, upload baseline artifact, and only
 then conditionally checkout/run candidate. On baseline upload failure, create
-the trusted skipped candidate status artifact. Upload candidate artifact and
+the trusted skipped candidate status artifact with the stdlib controller even
+when pinned-toolchain bootstrap failed. Build the trusted benchmark payload
+once before candidate checkout and pass the same payload root/summary to both
+pairs. Upload candidate artifact and
 export each upload action's exact ID/digest/name as benchmark job outputs before
 finishing with an adjudication step. Candidate checkout/build/run steps must be
 guarded by successful baseline artifact upload, not merely baseline pytest
@@ -730,6 +747,10 @@ trusted job outputs before validating the internal manifest. Then render the
 report/comment, upsert the bot comment via the resolver helper, upload the full
 report artifact, export/record its exact ID and digest, and return the final
 success/failure decision.
+
+Keep detailed reporter outputs when rendering succeeds but adjudication is
+non-zero, and generate generic fallback text only when no complete detailed
+output set exists.
 
 - [ ] **Step 6: Run workflow tests and actionlint**
 
