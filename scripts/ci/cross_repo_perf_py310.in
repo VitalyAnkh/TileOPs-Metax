@@ -1,0 +1,24 @@
+torch @ https://repos.metax-tech.com/r/maca-pypi/packages/torch/2.8.0+metax3.7.1.3/torch-2.8.0+metax3.7.1.3-cp310-cp310-linux_x86_64.whl#sha256=81775cdc54b870f9c18c01266cdf1bf2f462a22e9609b6f7b35fd33aef1292da
+triton @ https://files.pythonhosted.org/packages/fd/6e/676ab5019b4dde8b9b7bab71245102fc02778ef3df48218b298686b9ffd6/triton-3.5.1-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl#sha256=5fc53d849f879911ea13f4a877243afc513187bc7ee92d1f2c0f1ba3169e3c94
+apache-tvm-ffi==0.1.11
+build==1.3.0
+cloudpickle==3.1.2
+cmake==4.1.2
+cython==3.2.4
+einops==0.8.2
+ml-dtypes==0.5.4
+ninja==1.13.0
+numpy==2.2.6
+packaging==26.0
+patchelf==0.17.2.4
+psutil==7.2.2
+pytest==9.0.2
+pytest-timeout==2.4.0
+pyyaml==6.0.3
+scikit-build-core==0.11.6
+setuptools==80.9.0
+torch-c-dlpack-ext==0.1.5
+tqdm==4.67.3
+typing-extensions==4.15.0
+wheel==0.46.3
+z3-solver==4.15.4.0

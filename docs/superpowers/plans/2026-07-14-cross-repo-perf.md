@@ -170,9 +170,10 @@ Test that the runtime module:
 - validates all transitive lock entries contain hashes;
 - bootstraps only the locked uv/CPython archives into an empty root, rejecting
   size/hash mismatch, redirects outside the approved hosts, archive traversal,
-  symlink/hardlink/device entries, wrong executable versions, missing
-  `Python.h`, failed C-extension compile/import, or any fallback to an
-  unqualified/default Python;
+  absolute or escaping links, hardlink/device entries, wrong executable
+  versions, missing `Python.h`, failed C-extension compile/import, or any
+  fallback to an unqualified/default Python; relative symlinks are accepted
+  only when their normalized targets remain inside the extraction root;
 - emits deterministic JSON with sorted keys;
 - replaces every inherited cache/home/temp path, rejects symlink components, and
   keeps `HOME`, `TMPDIR`, XDG, uv, pip, ccache, TileLang, Triton, Torch, CUDA,
@@ -319,7 +320,8 @@ python3 scripts/cross_repo_perf_runtime.py bootstrap-toolchain \
 
 The invoking `python3` is only a trusted stdlib controller. The command itself
 downloads from the two lock URLs without executing them, enforces final URL
-host/path, size, and SHA-256, safely extracts regular files/directories only,
+host/path, size, and SHA-256, safely extracts regular files/directories plus
+in-root relative symlinks while rejecting hardlinks, devices, and link escapes,
 checks exact uv/Python versions, verifies `Python.h`, compiles and imports a
 minimal extension with the pinned interpreter/include directory, and writes
 deterministic provenance containing archive and executable hashes. It prints

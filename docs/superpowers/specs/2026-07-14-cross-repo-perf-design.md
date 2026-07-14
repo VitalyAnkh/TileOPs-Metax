@@ -225,6 +225,10 @@ Python executable, standard library, include directory, and `Python.h`; it must
 not use the runner's default interpreter. Before continuing, it compiles,
 imports, and deletes a minimal C extension against that interpreter to prove the
 headers, compiler, linker, and extension suffix form a working build toolchain.
+Archive extraction rejects traversal, absolute or escaping links, hard links,
+and device entries. It permits only relative symbolic links whose normalized
+targets remain inside the extraction root, because the pinned managed Python
+archive uses such links internally.
 The selected uv/Python versions and artifact hashes are recorded in provenance.
 
 The repository owns a hash-locked Python 3.10 requirements file covering the
