@@ -179,6 +179,9 @@ async function resolveRequest({
   if (!context.payload || !context.payload.issue || !context.payload.issue.pull_request) {
     return { disposition: "ignore", reason: "issue is not a pull request" };
   }
+  if (typeof harnessSha256 !== "string" || !/^[0-9a-f]{64}$/.test(harnessSha256)) {
+    throw new Error("trusted harness SHA-256 is required");
+  }
   if (!Number.isInteger(mergeableAttempts) || mergeableAttempts < 1 || mergeableAttempts > 10) {
     throw new Error("mergeableAttempts must be an integer between 1 and 10");
   }

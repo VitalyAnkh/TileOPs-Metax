@@ -235,6 +235,39 @@ test("resolveRequest returns immutable baseline and candidate identities", async
   });
 });
 
+test("resolveRequest requires a trusted harness SHA-256", async () => {
+  for (const harnessSha256 of [undefined, "", "abc", "g".repeat(64), "a".repeat(63)]) {
+    const fixture = makeFixture();
+    await assert.rejects(
+      resolveRequest({
+        github: fixture.github,
+        context: fixture.context,
+        body: command(),
+        harnessSha256,
+        sleep: async () => {},
+      }),
+      /harness.*sha-256/i,
+    );
+  }
+});
+
+test("resolveRequest propagates unexpected Octokit failures", async () => {
+  const fixture = makeFixture();
+  fixture.github.rest.repos.get = async () => {
+    throw new Error("octokit transport failed");
+  };
+  await assert.rejects(
+    resolveRequest({
+      github: fixture.github,
+      context: fixture.context,
+      body: command(),
+      harnessSha256: "f".repeat(64),
+      sleep: async () => {},
+    }),
+    /octokit transport failed/,
+  );
+});
+
 test("resolveRequest retries a null mergeability result with a fixed bound", async () => {
   const first = makePr({
     repository: TILELANG_REPO,
