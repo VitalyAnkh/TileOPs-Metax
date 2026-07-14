@@ -35,12 +35,19 @@ function splitRepository(repository) {
 
 async function repositoryPermission(github, repository, username) {
   const { owner, repo } = splitRepository(repository);
-  const response = await github.rest.repos.getCollaboratorPermissionLevel({
-    owner,
-    repo,
-    username,
-  });
-  return response.data.permission || response.data.role_name || "";
+  try {
+    const response = await github.rest.repos.getCollaboratorPermissionLevel({
+      owner,
+      repo,
+      username,
+    });
+    return response.data.permission || response.data.role_name || "";
+  } catch (error) {
+    if (error && (error.status === 404 || (error.response && error.response.status === 404))) {
+      return "";
+    }
+    throw error;
+  }
 }
 
 async function defaultBranchIdentity(github, repository) {

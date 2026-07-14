@@ -346,6 +346,25 @@ test("resolveRequest rejects untrusted permissions", async (t) => {
   }
 });
 
+test("resolveRequest treats a collaborator permission 404 as no permission", async () => {
+  const fixture = makeFixture();
+  fixture.github.rest.repos.getCollaboratorPermissionLevel = async () => {
+    const error = new Error("Not Found");
+    error.status = 404;
+    throw error;
+  };
+  const result = await resolveRequest({
+    github: fixture.github,
+    context: fixture.context,
+    body: command(),
+    harnessSha256: "f".repeat(64),
+    sleep: async () => {},
+  });
+  assert.equal(result.disposition, "reject");
+  assert.match(result.reason, /permission/i);
+  assert.equal(fixture.calls.some(([name]) => name === "pulls.get"), false);
+});
+
 test("resolveRequest rejects invalid PR trust and ref states", async (t) => {
   const cases = [
     ["closed TileOps PR", { tileops: { state: "closed" } }, /open/i],
