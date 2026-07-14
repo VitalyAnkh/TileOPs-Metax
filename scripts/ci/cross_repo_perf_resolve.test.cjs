@@ -34,15 +34,17 @@ function makePr({
   baseRef = "dev",
   baseSha = defaultSha,
   headRepository = repository,
+  headRef = `feature-${number}`,
   mergeable = true,
+  htmlUrl = `https://github.com/${repository}/pull/${number}`,
 }) {
   return {
     number,
     state,
-    html_url: `https://github.com/${repository}/pull/${number}`,
+    html_url: htmlUrl,
     user: { login: author },
     base: { ref: baseRef, sha: baseSha, repo: { full_name: repository } },
-    head: { ref: `feature-${number}`, sha: headSha, repo: { full_name: headRepository } },
+    head: { ref: headRef, sha: headSha, repo: { full_name: headRepository } },
     mergeable,
     merge_commit_sha: mergeSha,
   };
@@ -320,7 +322,11 @@ test("resolveRequest rejects invalid PR trust and ref states", async (t) => {
     ["wrong default target", { tilelang: { baseRef: "main" } }, /default branch/i],
     ["stale base SHA", { tileops: { baseSha: "9".repeat(40) } }, /base sha/i],
     ["conflict", { tilelang: { mergeable: false } }, /conflict/i],
+    ["malformed mergeability", { tilelang: { mergeable: "yes" } }, /mergeability/i],
     ["missing merge SHA", { tileops: { mergeSha: null } }, /merge sha/i],
+    ["missing PR URL", { tileops: { htmlUrl: null } }, /url/i],
+    ["missing head ref", { tilelang: { headRef: "" } }, /head ref/i],
+    ["missing head SHA", { tileops: { headSha: null } }, /head sha/i],
   ];
   for (const [label, overrides, reason] of cases) {
     await t.test(label, async () => {

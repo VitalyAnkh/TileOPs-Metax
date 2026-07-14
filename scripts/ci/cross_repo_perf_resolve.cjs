@@ -74,32 +74,67 @@ async function pullWithMergeability(
   for (let attempt = 0; attempt < mergeableAttempts; attempt += 1) {
     const response = await github.rest.pulls.get({ owner, repo, pull_number: pullNumber });
     pull = response.data;
-    if (pull.mergeable !== null) {
+    if (pull.mergeable === true || pull.mergeable === false) {
       return { pull, mergeabilityAvailable: true };
+    }
+    if (pull.mergeable !== null) {
+      return { pull, mergeabilityAvailable: false, mergeabilityMalformed: true };
     }
     if (attempt + 1 < mergeableAttempts) {
       await sleep(attempt + 1);
     }
   }
-  return { pull, mergeabilityAvailable: false };
+  return { pull, mergeabilityAvailable: false, mergeabilityMalformed: false };
 }
 
 function reject(reason) {
   return { disposition: "reject", reason };
 }
 
-function validatePull(repository, pull, defaults, mergeabilityAvailable) {
+function isNonemptyString(value) {
+  return typeof value === "string" && value.length > 0;
+}
+
+function isCommitSha(value) {
+  return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+
+function validatePull(
+  repository,
+  pull,
+  defaults,
+  mergeabilityAvailable,
+  mergeabilityMalformed = false,
+) {
   if (pull.state !== "open") {
     return `${repository} pull request must be open`;
+  }
+  if (!Number.isSafeInteger(pull.number) || pull.number <= 0) {
+    return `${repository} pull request number is invalid`;
+  }
+  if (!isNonemptyString(pull.html_url)) {
+    return `${repository} pull request URL is missing`;
+  }
+  if (!pull.user || !isNonemptyString(pull.user.login)) {
+    return `${repository} pull request author is missing`;
   }
   if (!pull.head || !pull.head.repo || pull.head.repo.full_name !== repository) {
     return `${repository} pull request head must be a branch in the same repository`;
   }
+  if (!isNonemptyString(pull.head.ref)) {
+    return `${repository} pull request head ref is missing`;
+  }
+  if (!isCommitSha(pull.head.sha)) {
+    return `${repository} pull request head SHA is invalid`;
+  }
   if (!pull.base || pull.base.ref !== defaults.defaultBranch) {
     return `${repository} pull request must target the default branch`;
   }
-  if (pull.base.sha !== defaults.defaultSha) {
+  if (!isCommitSha(pull.base.sha) || pull.base.sha !== defaults.defaultSha) {
     return `${repository} pull request base SHA is stale relative to the default branch`;
+  }
+  if (mergeabilityMalformed) {
+    return `${repository} pull request mergeability value is malformed`;
   }
   if (!mergeabilityAvailable) {
     return `${repository} pull request mergeability is unavailable after bounded retries`;
@@ -107,7 +142,7 @@ function validatePull(repository, pull, defaults, mergeabilityAvailable) {
   if (pull.mergeable === false) {
     return `${repository} pull request has a merge conflict`;
   }
-  if (typeof pull.merge_commit_sha !== "string" || pull.merge_commit_sha.length === 0) {
+  if (!isCommitSha(pull.merge_commit_sha)) {
     return `${repository} pull request has no merge SHA`;
   }
   return null;
@@ -181,6 +216,7 @@ async function resolveRequest({
     tileopsResult.pull,
     tileopsDefaults,
     tileopsResult.mergeabilityAvailable,
+    tileopsResult.mergeabilityMalformed,
   );
   if (tileopsError) {
     return reject(tileopsError);
@@ -190,6 +226,7 @@ async function resolveRequest({
     tilelangResult.pull,
     tilelangDefaults,
     tilelangResult.mergeabilityAvailable,
+    tilelangResult.mergeabilityMalformed,
   );
   if (tilelangError) {
     return reject(tilelangError);
